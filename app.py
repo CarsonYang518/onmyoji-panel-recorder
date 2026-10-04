@@ -1,0 +1,118 @@
+from __future__ import annotations
+from pathlib import Path
+from datetime import date
+import cv2,numpy as np,pandas as pd,streamlit as st
+from matcher import PanelDB,FIELDS
+from ocr_engine import PanelOCR
+from storage import Store
+from security import gate,configured
+
+ROOT=Path(__file__).parent; DATA=ROOT/"data/duel-panels.json"
+st.set_page_config(page_title="阴阳师 · 对弈竞猜数据台",page_icon="⚔️",layout="wide")
+st.markdown("""<style>
+.block-container{padding-top:1.4rem;max-width:1500px}.hero{padding:18px 22px;border:1px solid rgba(128,128,128,.22);border-radius:18px;margin-bottom:12px}.muted{opacity:.72}.stTabs [data-baseweb=tab-list]{gap:8px}.stTabs [data-baseweb=tab]{border-radius:10px;padding:8px 14px}.unit-title{font-size:1.08rem;font-weight:700;margin-top:.15rem}.confidence{font-size:.82rem;opacity:.72}.redtag{color:#d9534f}.bluetag{color:#4285f4}
+</style>""",unsafe_allow_html=True)
+
+def file_sig(p):
+    s=p.stat(); return (str(p),s.st_mtime_ns,s.st_size)
+@st.cache_resource
+def get_db(sig): return PanelDB(sig[0])
+@st.cache_resource
+def get_ocr(): return PanelOCR()
+DB=get_db(file_sig(DATA)); OCR=get_ocr(); STORE=Store(ROOT/"storage")
+def decode(b):return cv2.imdecode(np.frombuffer(b,np.uint8),cv2.IMREAD_COLOR)
+
+def recalc(r):
+    ev=DB.evidence(r.get("name",""),r); r["soul_inferred"]=ev["soul"]; r["soul_match_score"]=ev["score"]; r["soul_margin"]=ev["margin"]; r["soul_level"]=ev["level"]; r["reference_record_id"]=ev["reference_record_id"]; r["suggestions"]=ev["suggestions"]; r["soul_candidates"]=" | ".join(f'{x["soul"]}:{x["score"]:.3f}' for x in ev["candidates"])
+    if not r.get("soul") or r.get("soul")==r.get("_last_inferred",r.get("soul")): r["soul"]=ev["soul"]
+    r["_last_inferred"]=ev["soul"]; return r
+
+def edit_unit(r,key):
+    side=r["side"]; accent="🔴" if side=="RED" else "🔵"
+    st.markdown(f'<div class="unit-title">{accent} {side} · {r["slot"]}</div>',unsafe_allow_html=True)
+    c1,c2=st.columns(2)
+    old_name=r.get("name",""); name=c1.selectbox("式神",DB.names,index=DB.names.index(old_name) if old_name in DB.names else 0,key=f"{key}_name")
+    if name!=old_name:r["name"]=name; recalc(r)
+    souls=[""]+DB.souls; old_soul=r.get("soul",""); soul=c2.selectbox("御魂",souls,index=souls.index(old_soul) if old_soul in souls else 0,key=f"{key}_soul")
+    r["name"]=name;r["soul"]=soul
+    a=st.columns(4); b=st.columns(4)
+    for i,f in enumerate(FIELDS):
+        col=(a+b)[i]; val=r.get(f); r[f]=col.number_input(f.upper(),value=float(val or 0),step=1.0,key=f"{key}_{f}")
+    if st.button("重新匹配御魂",key=f"{key}_recalc",use_container_width=True): recalc(r); st.rerun()
+    level=r.get("soul_level","低"); st.caption(f'推断：{r.get("soul_inferred") or "—"} · 证据 {level} · score {r.get("soul_match_score",0):.3f} · margin {r.get("soul_margin",0):.3f}')
+    if r.get("soul_candidates"):st.caption("候选："+r["soul_candidates"])
+    sug=r.get("suggestions") or {}
+    if sug:
+        st.warning("疑似 OCR 异常："+"；".join(f"{f.upper()} {r.get(f)} → {v:g}" for f,v in sug.items()))
+        if st.button("接受建议修正",key=f"{key}_fix",use_container_width=True):
+            for f,v in sug.items():r[f]=v
+            recalc(r); st.rerun()
+    r["confirmed"]=st.checkbox("已人工核验",value=bool(r.get("confirmed")),key=f"{key}_ok")
+    return r
+
+def clean_row(r):
+    out={k:v for k,v in r.items() if not k.startswith("_")}; return out
+
+st.markdown(f'<div class="hero"><h2 style="margin:0">⚔️ 阴阳师 · 对弈竞猜数据台</h2><div class="muted">Carson Yang</div><div class="confidence">参考库 {len(DB.rows)} 条 · {len(DB.names)} 式神 · {len(DB.souls)} 御魂 · version {DB.version}</div></div>',unsafe_allow_html=True)
+if not configured():st.warning("当前没有配置 SAVE_PASSWORD：可以识别和浏览，但所有写入、修改、删除均被锁定。")
+
+t1,t2,t3,t4=st.tabs(["✨ 新比赛","🏁 补录结果","🗂️ 历史管理","⬇️ 导出"])
+with t1:
+    c1,c2=st.columns(2); red=c1.file_uploader("红方阵容详情",["png","jpg","jpeg"],key="red"); blue=c2.file_uploader("蓝方阵容详情",["png","jpg","jpeg"],key="blue")
+    if red:c1.image(red,width="stretch")
+    if blue:c2.image(blue,width="stretch")
+    if red and blue and st.button("✨ 智能识别双方",type="primary",use_container_width=True):
+        with st.spinner("识别 10 个式神与 80 项面板，并计算御魂候选…"):
+            st.session_state.rows=OCR.parse_side(decode(red.getvalue()),"RED",DB)+OCR.parse_side(decode(blue.getvalue()),"BLUE",DB); st.session_state.rb=red.getvalue();st.session_state.bb=blue.getvalue();st.rerun()
+    if "rows" in st.session_state:
+        st.divider(); left,right=st.columns(2)
+        for side,col in (("RED",left),("BLUE",right)):
+            with col:
+                st.subheader("🔴 红方" if side=="RED" else "🔵 蓝方")
+                for r in [x for x in st.session_state.rows if x["side"]==side]:
+                    with st.container(border=True): edit_unit(r,f'new_{side}_{r["slot"]}')
+        st.divider(); a,b,c=st.columns([1,1,2]); md=a.date_input("日期",date.today()); mt=b.text_input("场次/时间"); notes=c.text_input("备注")
+        winner=st.selectbox("真实结果（未知可留空）",["","RED","BLUE","DRAW","INVALID"])
+        ok=gate("保存密码","save_password")
+        if st.button("💾 保存本场",type="primary",use_container_width=True,disabled=not ok):
+            rows=[clean_row(x) for x in st.session_state.rows]
+            if len(rows)!=10:st.error("必须有 10 个式神。")
+            elif not all(x.get("confirmed") for x in rows):st.error("请人工核验并勾选全部 10 个式神。")
+            else:
+                mid=STORE.save_match({"match_date":str(md),"match_time":mt,"winner":winner,"notes":notes,"reference_version":DB.version},rows,st.session_state.rb,st.session_state.bb); st.success(f"已保存 {mid}"); del st.session_state["rows"]
+with t2:
+    m=STORE.matches(); pending=m[m.status=="PENDING"] if not m.empty else m
+    if pending.empty:st.success("没有待补录结果的比赛。")
+    else:
+        st.dataframe(pending[["match_id","match_date","match_time","notes"]],hide_index=True,width="stretch")
+        mid=st.selectbox("比赛",pending.match_id.tolist()); w=st.radio("真实结果",["RED","BLUE","DRAW","INVALID"],horizontal=True); ok=gate("管理密码","winner_password")
+        if st.button("写入结果",type="primary",disabled=not ok):STORE.update_winner(mid,w);st.success("已更新");st.rerun()
+with t3:
+    m=STORE.matches()
+    if m.empty:st.info("还没有历史数据。")
+    else:
+        q=st.text_input("搜索 match_id / 日期 / 备注")
+        view=m.copy()
+        if q:view=view[view.astype(str).apply(lambda x:x.str.contains(q,case=False,na=False)).any(axis=1)]
+        st.dataframe(view[["match_id","match_date","match_time","winner","status","notes","updated_at"]],hide_index=True,width="stretch")
+        mid=st.selectbox("选择历史比赛",view.match_id.tolist()); units=STORE.units(mid); meta=m[m.match_id==mid].iloc[0]
+        st.subheader("比赛详情")
+        edited=[]; L,R=st.columns(2)
+        for side,col in (("RED",L),("BLUE",R)):
+            with col:
+                for _,x in units[units.side==side].iterrows():
+                    r=x.to_dict(); r["confirmed"]=bool(r.get("confirmed")); r.setdefault("soul_level","")
+                    with st.container(border=True): edited.append(edit_unit(r,f'hist_{mid}_{side}_{int(r["slot"])}'))
+        ea,eb,ec=st.columns([1,1,2]); ed=ea.text_input("日期",str(meta.match_date),key="edit_date"); et=eb.text_input("时间",str(meta.match_time),key="edit_time"); en=ec.text_input("备注",str(meta.notes or ""),key="edit_notes"); ew=st.selectbox("结果",["","RED","BLUE","DRAW","INVALID"],index=["","RED","BLUE","DRAW","INVALID"].index(str(meta.winner or "")),key="edit_winner")
+        ok=gate("管理密码","history_password"); x,y=st.columns(2)
+        if x.button("保存历史修改",type="primary",use_container_width=True,disabled=not ok):
+            if not all(r.get("confirmed") for r in edited):st.error("10 个式神都必须保持人工核验状态。")
+            else:STORE.update_match(mid,{"match_date":ed,"match_time":et,"notes":en,"winner":ew},[clean_row(r) for r in edited]);st.success("修改已保存");st.rerun()
+        confirm_delete=y.checkbox("我确认删除整场比赛",key="confirm_delete")
+        if y.button("🗑️ 删除比赛",use_container_width=True,disabled=not(ok and confirm_delete)):STORE.delete_match(mid);st.success("已删除");st.rerun()
+with t4:
+    m=STORE.matches();u=STORE.units(); a,b,c=st.columns(3);a.metric("比赛",len(m));b.metric("式神记录",len(u));c.metric("待补结果",int((m.status=="PENDING").sum()) if not m.empty else 0)
+    st.caption("导出为只读操作，不需要管理密码；导出文件不包含密码。")
+    for fn,label,mime in [("matches.csv","matches.csv","text/csv"),("units.csv","units.csv","text/csv"),("matches.jsonl","matches.jsonl","application/json")]:
+        p=ROOT/"storage"/fn
+        if p.exists():st.download_button(f"下载 {label}",p.read_bytes(),fn,mime,use_container_width=True)
