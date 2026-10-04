@@ -216,7 +216,39 @@ with t3:
         if y.button("🗑️ 删除比赛",use_container_width=True,disabled=not(ok and confirm_delete)):STORE.delete_match(mid);st.success("已删除");st.rerun()
 with t4:
     m=STORE.matches();u=STORE.units(); a,b,c=st.columns(3);a.metric("比赛",len(m));b.metric("式神记录",len(u));c.metric("待补结果",int((m.status=="PENDING").sum()) if not m.empty else 0)
-    st.caption("导出为只读操作，不需要管理密码；导出文件不包含密码。")
-    for fn,label,mime in [("matches.csv","matches.csv","text/csv"),("units.csv","units.csv","text/csv"),("matches.jsonl","matches.jsonl","application/json")]:
+
+    st.caption("所有数据导出均需要管理密码；导出文件不包含密码。")
+    export_ok=gate("管理密码","export_password")
+
+    for fn,label,mime in [
+        ("matches.csv","matches.csv","text/csv"),
+        ("units.csv","units.csv","text/csv"),
+        ("matches.jsonl","matches.jsonl","application/json"),
+    ]:
         p=ROOT/"storage"/fn
-        if p.exists():st.download_button(f"下载 {label}",p.read_bytes(),fn,mime,use_container_width=True)
+        if p.exists():
+            st.download_button(
+                f"下载 {label}",
+                p.read_bytes(),
+                fn,
+                mime,
+                use_container_width=True,
+                disabled=not export_ok,
+            )
+
+    st.divider()
+    st.subheader("🛡️ 数据库完整备份")
+    db_path=ROOT/"storage"/"matches.sqlite3"
+
+    if db_path.exists():
+        st.caption(f"SQLite 数据库大小：{db_path.stat().st_size/1024:.1f} KB")
+        st.download_button(
+            "⬇️ 下载 matches.sqlite3 完整备份",
+            data=db_path.read_bytes(),
+            file_name="matches.sqlite3",
+            mime="application/x-sqlite3",
+            use_container_width=True,
+            disabled=not export_ok,
+        )
+    else:
+        st.warning("当前未找到 SQLite 数据库文件。")
