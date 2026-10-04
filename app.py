@@ -7,7 +7,7 @@ from matcher import PanelDB,FIELDS
 from ocr_engine import PanelOCR
 from storage import Store
 from security import gate,configured
-from roi import locate_panel, draw_panel_preview
+from roi import locate_panel, draw_panel_preview, normalize_panel, COLS, SOUL_Y
 
 ROOT=Path(__file__).parent; DATA=ROOT/"data/duel-panels.json"
 st.set_page_config(page_title="阴阳师 · 对弈竞猜数据台",page_icon="⚔️",layout="wide")
@@ -79,6 +79,32 @@ def recognize_pair_with_progress(red_bytes: bytes, blue_bytes: bytes):
     progress.progress(100,text="100% · 识别完成")
     status.caption(f"完成 · 总耗时 {timing['总耗时']:.1f} 秒 · 本场固定 2 次整图 OCR")
     return rows,timing,{"RED":red_loc,"BLUE":blue_loc}
+
+
+
+def build_soul_samples(mid, rows, red_bytes, blue_bytes, panel_locs):
+    """Create 10 compact WebP crops from the already-located canonical panels."""
+    by_key={(r["side"],int(r["slot"])):r for r in rows}
+    samples=[]
+    for side,bts in (("RED",red_bytes),("BLUE",blue_bytes)):
+        img=decode(bts); loc=panel_locs.get(side) or {}
+        panel,_=normalize_panel(img,loc)
+        conf=float(loc.get("confidence",0) or 0)
+        for slot in range(1,6):
+            r=by_key[(side,slot)]
+            x1,x2=COLS[slot-1]; y1,y2=SOUL_Y
+            # Match roi.unit_rois(): remove side padding so text/borders contribute less.
+            cx1,cx2=x1+38,x2-38
+            crop=panel[y1:y2,cx1:cx2]
+            ok,buf=cv2.imencode(".webp",crop,[cv2.IMWRITE_WEBP_QUALITY,90])
+            if not ok: raise ValueError(f"{side} {slot} 御魂图片编码失败")
+            samples.append({
+                "side":side,"slot":slot,"shikigami_name":r.get("name","") or "",
+                "soul_confirmed":r.get("soul","") or "","soul_auto":r.get("soul_inferred","") or "",
+                "image_path":f"{mid}/{side}_{slot}.webp","image_bytes":buf.tobytes(),
+                "crop_x1":cx1,"crop_y1":y1,"crop_x2":cx2,"crop_y2":y2,
+                "panel_confidence":conf})
+    return samples
 
 def clear_editor_widget_state(prefix="new_"):
     for k in list(st.session_state.keys()):
@@ -183,7 +209,19 @@ with t1:
             if len(rows)!=10:st.error("必须有 10 个式神。")
             elif not all(x.get("confirmed") for x in rows):st.error("请人工核验并勾选全部 10 个式神。")
             else:
-                mid=STORE.save_match({"match_date":str(md),"match_time":mt,"winner":winner,"notes":notes,"reference_version":DB.version},rows,st.session_state.rb,st.session_state.bb); st.success(f"已保存 {mid}"); del st.session_state["rows"]
+                mid=STORE.save_match({"match_date":str(md),"match_time":mt,"winner":winner,"notes":notes,"reference_version":DB.version},rows,st.session_state.rb,st.session_state.bb)
+                st.success(f"比赛数据已保存 {mid}")
+                try:
+                    samples=build_soul_samples(mid,rows,st.session_state.rb,st.session_state.bb,st.session_state.get("panel_locs",{}))
+                    n,errors=STORE.save_soul_samples(mid,samples)
+                    if n==10:
+                        st.success("御魂图片样本已保存 10/10。")
+                    else:
+                        st.warning(f"比赛已正常保存；御魂图片样本保存 {n}/10。")
+                        if errors: st.caption("；".join(errors[:10]))
+                except Exception as e:
+                    st.warning(f"比赛已正常保存；御魂图片样本未保存：{e}")
+                del st.session_state["rows"]
 with t2:
     m=STORE.matches(); pending=m[m.status=="PENDING"] if not m.empty else m
     if pending.empty:st.success("没有待补录结果的比赛。")

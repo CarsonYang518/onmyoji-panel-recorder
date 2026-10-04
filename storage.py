@@ -1,5 +1,7 @@
 from __future__ import annotations
 import os, sqlite3, json, uuid, shutil
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
@@ -56,8 +58,85 @@ class Store:
         return ",".join(["%s" if self.backend=="postgres" else "?"]*n)
 
     def _read(self,q,args=()):
+        if self.backend=="postgres":
+            with self.con() as c:
+                with c.cursor() as cur:
+                    cur.execute(q,list(args))
+                    rows=cur.fetchall()
+                    cols=[d.name for d in cur.description]
+                    return pd.DataFrame(rows,columns=cols)
         with self.con() as c:
             return pd.read_sql_query(q,c,params=list(args))
+
+    def _secret(self,name):
+        try:
+            import streamlit as st
+            v=st.secrets.get(name,"")
+            if v: return str(v).strip()
+        except Exception:
+            pass
+        return os.environ.get(name,"").strip()
+
+    def storage_configured(self):
+        return bool(self._secret("SUPABASE_URL") and self._secret("SUPABASE_SECRET_KEY"))
+
+    def _upload_storage(self,path,data,content_type="image/webp"):
+        base=self._secret("SUPABASE_URL").rstrip("/")
+        key=self._secret("SUPABASE_SECRET_KEY")
+        if not base or not key:
+            raise RuntimeError("未配置 SUPABASE_URL / SUPABASE_SECRET_KEY")
+        encoded="/".join(quote(x,safe="") for x in path.split("/"))
+        url=f"{base}/storage/v1/object/soul-icons/{encoded}"
+        req=Request(url,data=data,method="POST",headers={
+            "Authorization":f"Bearer {key}","apikey":key,
+            "Content-Type":content_type,"x-upsert":"true"})
+        with urlopen(req,timeout=30) as resp:
+            if not (200 <= resp.status < 300):
+                raise RuntimeError(f"Storage upload HTTP {resp.status}")
+
+    def save_soul_samples(self,mid,samples):
+        """Upload confirmed soul crops, then index successful uploads in soul_samples.
+
+        This is deliberately separate from save_match(): image-storage failure must never
+        roll back an otherwise valid match. Returns (saved_count, errors).
+        """
+        if self.backend!="postgres":
+            return 0,["当前不是 PostgreSQL 后端，未上传御魂样本"]
+        saved=0; errors=[]
+        sql="""INSERT INTO soul_samples
+               (match_id,side,slot,shikigami_name,soul_confirmed,soul_auto,image_path,
+                crop_x1,crop_y1,crop_x2,crop_y2,panel_confidence)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (match_id,side,slot) DO UPDATE SET
+               shikigami_name=EXCLUDED.shikigami_name,
+               soul_confirmed=EXCLUDED.soul_confirmed,soul_auto=EXCLUDED.soul_auto,
+               image_path=EXCLUDED.image_path,crop_x1=EXCLUDED.crop_x1,crop_y1=EXCLUDED.crop_y1,
+               crop_x2=EXCLUDED.crop_x2,crop_y2=EXCLUDED.crop_y2,
+               panel_confidence=EXCLUDED.panel_confidence"""
+        for x in samples:
+            try:
+                self._upload_storage(x["image_path"],x["image_bytes"])
+                vals=(mid,x["side"],int(x["slot"]),x.get("shikigami_name","") or "",
+                      x.get("soul_confirmed","") or "",x.get("soul_auto","") or "",x["image_path"],
+                      int(x["crop_x1"]),int(x["crop_y1"]),int(x["crop_x2"]),int(x["crop_y2"]),
+                      x.get("panel_confidence"))
+                with self.con() as c:
+                    with c.cursor() as cur: cur.execute(sql,vals)
+                saved+=1
+            except Exception as e:
+                errors.append(f'{x.get("side")} {x.get("slot")}: {e}')
+        return saved,errors
+
+    def sync_soul_sample_labels(self,mid,rows):
+        """Keep an existing sample label aligned with later human history edits."""
+        if self.backend!="postgres": return
+        with self.con() as c:
+            with c.cursor() as cur:
+                for r in rows:
+                    cur.execute("""UPDATE soul_samples SET shikigami_name=%s,soul_confirmed=%s,soul_auto=%s
+                                   WHERE match_id=%s AND side=%s AND slot=%s""",
+                                (r.get("name","") or "",r.get("soul","") or "",r.get("soul_inferred","") or "",
+                                 mid,r["side"],int(r["slot"])))
 
     def save_match(self,meta,rows,red_bytes=None,blue_bytes=None):
         self._backup()
@@ -110,6 +189,7 @@ class Store:
                          "COMPLETE" if meta.get("winner") else "PENDING",meta.get("notes",""),now,mid))
             cur.execute(f"DELETE FROM units WHERE match_id={p}",(mid,))
             self._write_units(cur,mid,rows)
+        self.sync_soul_sample_labels(mid,rows)
         self.export()
 
     def delete_match(self,mid):
