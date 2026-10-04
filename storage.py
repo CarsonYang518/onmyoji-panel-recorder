@@ -35,7 +35,7 @@ class Store:
     def con(self):
         if self.backend=="postgres":
             import psycopg
-            return psycopg.connect(self.database_url,connect_timeout=15)
+            return psycopg.connect(self.database_url,connect_timeout=15,prepare_threshold=None,)
         c=sqlite3.connect(self.db,timeout=20); c.row_factory=sqlite3.Row
         c.execute("PRAGMA foreign_keys=ON")
         return c
