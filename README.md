@@ -102,7 +102,7 @@ V3.2 removes automatic per-cell OCR fallback. In the normal recognition path it 
 
 The recognition page now reports real stage progress (0-100%) and stores timing diagnostics for OCR model initialization, red-side OCR, blue-side OCR, coordinate parsing, soul matching, and total elapsed time. Normal Streamlit widget reruns do not invoke OCR again. Editing one unit only recalculates that unit's soul evidence.
 
-## V3.3：自适应主面板定位
+## V3.3.1：自适应主面板定位
 
 V3.3 不再假设整张截图具有固定分辨率或固定长宽比。识别前先利用「阵容详情」表格的纵横网格几何结构定位主面板，裁剪后统一映射到 1000×491 的内部坐标系，再执行 5 列 × 8 属性解析。
 
@@ -114,3 +114,8 @@ V3.3 不再假设整张截图具有固定分辨率或固定长宽比。识别前
 - OCR 正常路径仍为每张截图一次，共两次，不恢复逐格 fallback。
 
 已用项目内原始 1026×542 左右截图，以及 1536×706 新截图验证主面板几何定位。
+
+
+## V3.3.1 hotfix
+- Normalizes OpenCV `HoughLinesP` output to `(-1, 4)` across OpenCV builds.
+- Malformed/empty line output now fails panel detection cleanly instead of crashing Streamlit.

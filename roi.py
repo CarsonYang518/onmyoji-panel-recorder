@@ -54,10 +54,22 @@ def locate_panel(img: np.ndarray):
                           minLineLength=max(100,int(min(w,h)*0.34)),maxLineGap=max(10,int(min(w,h)*0.025)))
     vertical=[]; horizontal=[]
     if lines is not None:
-        for x1,y1,x2,y2 in lines[:,0]:
-            dx=abs(int(x2)-int(x1)); dy=abs(int(y2)-int(y1))
-            if dy > 0.42*h and dx < max(9,0.012*w): vertical.append((x1+x2)/2)
-            if dx > 0.48*w and dy < max(9,0.012*h): horizontal.append((y1+y2)/2)
+        # OpenCV builds may return HoughLinesP as (N,1,4), (N,4), or
+        # occasionally another array-like wrapper. Normalize it defensively.
+        try:
+            arr = np.asarray(lines)
+            if arr.size:
+                arr = arr.reshape(-1, 4)
+                for line in arr:
+                    x1, y1, x2, y2 = (int(v) for v in line.tolist())
+                    dx=abs(x2-x1); dy=abs(y2-y1)
+                    if dy > 0.42*h and dx < max(9,0.012*w): vertical.append((x1+x2)/2)
+                    if dx > 0.48*w and dy < max(9,0.012*h): horizontal.append((y1+y2)/2)
+        except (TypeError, ValueError, IndexError):
+            # Treat malformed/empty Hough output as no detected grid instead of
+            # crashing the whole Streamlit app. locate_panel() will return a
+            # clean failed-location result below.
+            vertical=[]; horizontal=[]
     xs=_cluster(vertical,max(5,w*0.006))
     ys=_cluster(horizontal,max(5,h*0.009))
     best=_best_six_equal(xs)
