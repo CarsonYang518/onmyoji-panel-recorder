@@ -23,29 +23,66 @@ DB=get_db(file_sig(DATA)); OCR=get_ocr(); STORE=Store(ROOT/"storage")
 def decode(b):return cv2.imdecode(np.frombuffer(b,np.uint8),cv2.IMREAD_COLOR)
 
 def recalc(r):
-    ev=DB.evidence(r.get("name",""),r); r["soul_inferred"]=ev["soul"]; r["soul_match_score"]=ev["score"]; r["soul_margin"]=ev["margin"]; r["soul_level"]=ev["level"]; r["reference_record_id"]=ev["reference_record_id"]; r["suggestions"]=ev["suggestions"]; r["soul_candidates"]=" | ".join(f'{x["soul"]}:{x["score"]:.3f}' for x in ev["candidates"])
-    if not r.get("soul") or r.get("soul")==r.get("_last_inferred",r.get("soul")): r["soul"]=ev["soul"]
-    r["_last_inferred"]=ev["soul"]; return r
+    old_inferred=r.get("soul_inferred","")
+    old_soul=r.get("soul","")
+    ev=DB.evidence(r.get("name",""),r)
+    r["soul_inferred"]=ev["soul"]; r["soul_match_score"]=ev["score"]; r["soul_margin"]=ev["margin"]
+    r["soul_level"]=ev["level"]; r["reference_record_id"]=ev["reference_record_id"]; r["suggestions"]=ev["suggestions"]
+    r["soul_candidates"]=" | ".join(f'{x["soul"]}:{x["score"]:.3f}' for x in ev["candidates"])
+    auto_changed=False
+    if not old_soul or old_soul==old_inferred:
+        r["soul"]=ev["soul"]; auto_changed=(old_soul!=r["soul"])
+    r["_match_signature"]=(r.get("name","")+"",)+tuple(r.get(f) for f in FIELDS)
+    return auto_changed
+
+@st.cache_data(show_spinner=False)
+def recognize_pair(red_bytes: bytes, blue_bytes: bytes, reference_version: str):
+    # Cached by the two image byte strings + reference version. Re-running the page,
+    # changing a widget, or clicking Recognize again on the same images does not OCR again.
+    return OCR.parse_side(decode(red_bytes),"RED",DB)+OCR.parse_side(decode(blue_bytes),"BLUE",DB)
+
+def clear_editor_widget_state(prefix="new_"):
+    for k in list(st.session_state.keys()):
+        if str(k).startswith(prefix):
+            del st.session_state[k]
 
 def edit_unit(r,key):
     side=r["side"]; accent="🔴" if side=="RED" else "🔵"
     st.markdown(f'<div class="unit-title">{accent} {side} · {r["slot"]}</div>',unsafe_allow_html=True)
-    c1,c2=st.columns(2)
-    old_name=r.get("name",""); name=c1.selectbox("式神",DB.names,index=DB.names.index(old_name) if old_name in DB.names else 0,key=f"{key}_name")
-    if name!=old_name:r["name"]=name; recalc(r)
-    souls=[""]+DB.souls; old_soul=r.get("soul",""); soul=c2.selectbox("御魂",souls,index=souls.index(old_soul) if old_soul in souls else 0,key=f"{key}_soul")
-    r["name"]=name;r["soul"]=soul
+
+    old_name=r.get("name","")
+    name=st.selectbox("式神",DB.names,index=DB.names.index(old_name) if old_name in DB.names else 0,key=f"{key}_name")
+    r["name"]=name; r["name_manually_changed"]=bool(name!=r.get("name_detected",""))
+
+    # Editing stats never invokes OCR. Only this unit's cheap reference match is recomputed.
     a=st.columns(4); b=st.columns(4)
     for i,f in enumerate(FIELDS):
-        col=(a+b)[i]; val=r.get(f); r[f]=col.number_input(f.upper(),value=float(val or 0),step=1.0,key=f"{key}_{f}")
-    if st.button("重新匹配御魂",key=f"{key}_recalc",use_container_width=True): recalc(r); st.rerun()
-    level=r.get("soul_level","低"); st.caption(f'推断：{r.get("soul_inferred") or "—"} · 证据 {level} · score {r.get("soul_match_score",0):.3f} · margin {r.get("soul_margin",0):.3f}')
+        col=(a+b)[i]; val=r.get(f)
+        r[f]=col.number_input(f.upper(),value=float(val or 0),step=1.0,key=f"{key}_{f}")
+
+    sig=(r.get("name","")+"",)+tuple(r.get(f) for f in FIELDS)
+    auto_changed=False
+    if sig != r.get("_match_signature"):
+        auto_changed=recalc(r)
+
+    souls=[""]+DB.souls; soul_key=f"{key}_soul"
+    if auto_changed and soul_key in st.session_state:
+        st.session_state[soul_key]=r.get("soul","")
+    old_soul=r.get("soul","")
+    soul=st.selectbox("御魂",souls,index=souls.index(old_soul) if old_soul in souls else 0,key=soul_key)
+    r["soul"]=soul; r["soul_manually_changed"]=bool(soul!=r.get("soul_inferred",""))
+
+    if st.button("重新匹配本式神御魂",key=f"{key}_recalc",use_container_width=True):
+        recalc(r); st.rerun()
+    level=r.get("soul_level","低")
+    st.caption(f'推断：{r.get("soul_inferred") or "—"} · 证据 {level} · score {r.get("soul_match_score",0):.3f} · margin {r.get("soul_margin",0):.3f}')
     if r.get("soul_candidates"):st.caption("候选："+r["soul_candidates"])
     sug=r.get("suggestions") or {}
     if sug:
         st.warning("疑似 OCR 异常："+"；".join(f"{f.upper()} {r.get(f)} → {v:g}" for f,v in sug.items()))
         if st.button("接受建议修正",key=f"{key}_fix",use_container_width=True):
-            for f,v in sug.items():r[f]=v
+            for f,v in sug.items():
+                r[f]=v; st.session_state[f"{key}_{f}"]=float(v)
             recalc(r); st.rerun()
     r["confirmed"]=st.checkbox("已人工核验",value=bool(r.get("confirmed")),key=f"{key}_ok")
     return r
@@ -53,7 +90,7 @@ def edit_unit(r,key):
 def clean_row(r):
     out={k:v for k,v in r.items() if not k.startswith("_")}; return out
 
-st.markdown(f'<div class="hero"><h2 style="margin:0">⚔️ 阴阳师 · 对弈竞猜数据台</h2><div class="muted">Carson Yang</div><div class="confidence">参考库 {len(DB.rows)} 条 · {len(DB.names)} 式神 · {len(DB.souls)} 御魂 · version {DB.version}</div></div>',unsafe_allow_html=True)
+st.markdown(f'<div class="hero"><h2 style="margin:0">⚔️ 阴阳师 · 对弈竞猜数据台</h2><div class="muted">固定布局 OCR · 动态式神/御魂库 · 八维面板反推 · 人工核验 · 受保护历史数据</div><div class="confidence">参考库 {len(DB.rows)} 条 · {len(DB.names)} 式神 · {len(DB.souls)} 御魂 · version {DB.version}</div></div>',unsafe_allow_html=True)
 if not configured():st.warning("当前没有配置 SAVE_PASSWORD：可以识别和浏览，但所有写入、修改、删除均被锁定。")
 
 t1,t2,t3,t4=st.tabs(["✨ 新比赛","🏁 补录结果","🗂️ 历史管理","⬇️ 导出"])
@@ -62,9 +99,15 @@ with t1:
     if red:c1.image(red,width="stretch")
     if blue:c2.image(blue,width="stretch")
     if red and blue and st.button("✨ 智能识别双方",type="primary",use_container_width=True):
-        with st.spinner("识别 10 个式神与 80 项面板，并计算御魂候选…"):
-            st.session_state.rows=OCR.parse_side(decode(red.getvalue()),"RED",DB)+OCR.parse_side(decode(blue.getvalue()),"BLUE",DB); st.session_state.rb=red.getvalue();st.session_state.bb=blue.getvalue();st.rerun()
+        rb,bb=red.getvalue(),blue.getvalue()
+        with st.spinner("首次识别 10 个式神与 80 项面板…（同一图片之后不会重复 OCR）"):
+            rows=recognize_pair(rb,bb,DB.version)
+        clear_editor_widget_state("new_")
+        st.session_state.rows=rows; st.session_state.rb=rb; st.session_state.bb=bb
+        st.session_state.ocr_done=True
+        st.rerun()
     if "rows" in st.session_state:
+        st.success("OCR 已完成并缓存。下面修改式神、属性、御魂、核验状态或密码都不会再次运行 OCR；属性变化只重算对应式神的御魂候选。")
         st.divider(); left,right=st.columns(2)
         for side,col in (("RED",left),("BLUE",right)):
             with col:

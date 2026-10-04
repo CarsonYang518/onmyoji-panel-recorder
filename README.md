@@ -85,3 +85,13 @@ SAVE_PASSWORD = "你的强密码"
 ```
 
 注意：Community Cloud 的应用本地文件系统不应被当作长期数据库。如果要在线长期积累真实竞猜数据，下一步应把 `Store` 后端换成持久化云数据库（例如 PostgreSQL），UI/识别/匹配层不需要重写。
+
+## V3.1 performance update
+
+V3.1 separates OCR from Streamlit reruns. OCR runs only when **智能识别双方** is pressed for a new image pair. The result is stored in `st.session_state`, and the same image pair/reference version is also cached with `st.cache_data`.
+
+The fixed-layout OCR pipeline now packs the five name ROIs and forty numeric ROIs on each side into contact sheets. In the normal path this reduces RapidOCR engine invocations from roughly 350 per match in V3 to 4 per match (2 per side). Only cells missed by the sheet pass use a one-call fallback.
+
+After OCR, changing a shikigami or any of its eight stats only recomputes soul evidence for that single unit. Changing a soul manually, checking confirmation, entering a password, changing notes/date/winner, or navigating the page does not run OCR again.
+
+Deployment runtime is pinned to Python 3.12 via `.python-version` for better OpenCV/ONNX compatibility on Streamlit Community Cloud.
