@@ -1,11 +1,13 @@
 from __future__ import annotations
 from pathlib import Path
 from datetime import date
+import time, hashlib
 import cv2,numpy as np,pandas as pd,streamlit as st
 from matcher import PanelDB,FIELDS
 from ocr_engine import PanelOCR
 from storage import Store
 from security import gate,configured
+from roi import locate_panel, draw_panel_preview
 
 ROOT=Path(__file__).parent; DATA=ROOT/"data/duel-panels.json"
 st.set_page_config(page_title="阴阳师 · 对弈竞猜数据台",page_icon="⚔️",layout="wide")
@@ -19,7 +21,7 @@ def file_sig(p):
 def get_db(sig): return PanelDB(sig[0])
 @st.cache_resource
 def get_ocr(): return PanelOCR()
-DB=get_db(file_sig(DATA)); OCR=get_ocr(); STORE=Store(ROOT/"storage")
+DB=get_db(file_sig(DATA)); STORE=Store(ROOT/"storage")
 def decode(b):return cv2.imdecode(np.frombuffer(b,np.uint8),cv2.IMREAD_COLOR)
 
 def recalc(r):
@@ -35,11 +37,48 @@ def recalc(r):
     r["_match_signature"]=(r.get("name","")+"",)+tuple(r.get(f) for f in FIELDS)
     return auto_changed
 
-@st.cache_data(show_spinner=False)
-def recognize_pair(red_bytes: bytes, blue_bytes: bytes, reference_version: str):
-    # Cached by the two image byte strings + reference version. Re-running the page,
-    # changing a widget, or clicking Recognize again on the same images does not OCR again.
-    return OCR.parse_side(decode(red_bytes),"RED",DB)+OCR.parse_side(decode(blue_bytes),"BLUE",DB)
+def recognize_pair_with_progress(red_bytes: bytes, blue_bytes: bytes):
+    """Run exactly two full-image OCR inferences and expose real stage progress."""
+    progress=st.progress(0, text="0% · 准备识别")
+    status=st.empty()
+    t0=time.perf_counter(); timing={}
+
+    def step(pct,msg):
+        elapsed=time.perf_counter()-t0
+        progress.progress(pct,text=f"{pct}% · {msg}")
+        status.caption(f"当前：{msg}　·　已用时 {elapsed:.1f} 秒")
+
+    step(5,"初始化 OCR 引擎")
+    t=time.perf_counter(); ocr=get_ocr(); timing["OCR模型初始化"]=time.perf_counter()-t
+    step(15,"OCR 引擎就绪")
+
+    red_img,blue_img=decode(red_bytes),decode(blue_bytes)
+    step(18,"定位红方『阵容详情』主面板")
+    t=time.perf_counter(); red_loc=locate_panel(red_img); timing["红方面板定位"]=time.perf_counter()-t
+    if not red_loc.get("ok"):
+        progress.empty(); status.empty(); raise ValueError("无法可靠定位红方『阵容详情』主面板，请检查截图是否完整。")
+    step(25,"定位蓝方『阵容详情』主面板")
+    t=time.perf_counter(); blue_loc=locate_panel(blue_img); timing["蓝方面板定位"]=time.perf_counter()-t
+    if not blue_loc.get("ok"):
+        progress.empty(); status.empty(); raise ValueError("无法可靠定位蓝方『阵容详情』主面板，请检查截图是否完整。")
+
+    step(32,"识别红方主面板（第 1/2 次 OCR）")
+    t=time.perf_counter(); red_items=ocr.recognize_full(red_img,red_loc); timing["红方整图OCR"]=time.perf_counter()-t
+    step(55,"红方 OCR 完成")
+
+    step(58,"识别蓝方主面板（第 2/2 次 OCR）")
+    t=time.perf_counter(); blue_items=ocr.recognize_full(blue_img,blue_loc); timing["蓝方整图OCR"]=time.perf_counter()-t
+    step(80,"蓝方 OCR 完成")
+
+    step(84,"在主面板归一化坐标中解析 10 个式神与 80 项面板")
+    t=time.perf_counter(); rows=ocr.parse_items(red_items,"RED",DB)+ocr.parse_items(blue_items,"BLUE",DB); timing["坐标解析"]=time.perf_counter()-t
+    step(91,"计算御魂候选")
+    t=time.perf_counter(); rows=ocr.attach_soul_evidence(rows,DB); timing["御魂候选"]=time.perf_counter()-t
+    step(98,"整理识别结果")
+    timing["总耗时"]=time.perf_counter()-t0
+    progress.progress(100,text="100% · 识别完成")
+    status.caption(f"完成 · 总耗时 {timing['总耗时']:.1f} 秒 · 本场固定 2 次整图 OCR")
+    return rows,timing,{"RED":red_loc,"BLUE":blue_loc}
 
 def clear_editor_widget_state(prefix="new_"):
     for k in list(st.session_state.keys()):
@@ -51,7 +90,8 @@ def edit_unit(r,key):
     st.markdown(f'<div class="unit-title">{accent} {side} · {r["slot"]}</div>',unsafe_allow_html=True)
 
     old_name=r.get("name","")
-    name=st.selectbox("式神",DB.names,index=DB.names.index(old_name) if old_name in DB.names else 0,key=f"{key}_name")
+    name_options=[""]+DB.names
+    name=st.selectbox("式神",name_options,index=name_options.index(old_name) if old_name in name_options else 0,key=f"{key}_name")
     r["name"]=name; r["name_manually_changed"]=bool(name!=r.get("name_detected",""))
 
     # Editing stats never invokes OCR. Only this unit's cheap reference match is recomputed.
@@ -90,7 +130,7 @@ def edit_unit(r,key):
 def clean_row(r):
     out={k:v for k,v in r.items() if not k.startswith("_")}; return out
 
-st.markdown(f'<div class="hero"><h2 style="margin:0">⚔️ 阴阳师 · 对弈竞猜数据台</h2><div class="muted">固定布局 OCR · 动态式神/御魂库 · 八维面板反推 · 人工核验 · 受保护历史数据</div><div class="confidence">参考库 {len(DB.rows)} 条 · {len(DB.names)} 式神 · {len(DB.souls)} 御魂 · version {DB.version}</div></div>',unsafe_allow_html=True)
+st.markdown(f'<div class="hero"><h2 style="margin:0">⚔️ 阴阳师 · 对弈竞猜数据台</h2><div class="muted">CarsonYang</div><div class="confidence">参考库 {len(DB.rows)} 条 · {len(DB.names)} 式神 · {len(DB.souls)} 御魂 · version {DB.version}</div></div>',unsafe_allow_html=True)
 if not configured():st.warning("当前没有配置 SAVE_PASSWORD：可以识别和浏览，但所有写入、修改、删除均被锁定。")
 
 t1,t2,t3,t4=st.tabs(["✨ 新比赛","🏁 补录结果","🗂️ 历史管理","⬇️ 导出"])
@@ -100,14 +140,35 @@ with t1:
     if blue:c2.image(blue,width="stretch")
     if red and blue and st.button("✨ 智能识别双方",type="primary",use_container_width=True):
         rb,bb=red.getvalue(),blue.getvalue()
-        with st.spinner("首次识别 10 个式神与 80 项面板…（同一图片之后不会重复 OCR）"):
-            rows=recognize_pair(rb,bb,DB.version)
+        image_pair_id=hashlib.sha256(rb+bb).hexdigest()[:16]
+        # A normal widget rerun never enters this block. OCR only runs on this explicit button click.
+        try:
+            rows,timing,panel_locs=recognize_pair_with_progress(rb,bb)
+        except ValueError as e:
+            st.error(str(e)); st.stop()
         clear_editor_widget_state("new_")
         st.session_state.rows=rows; st.session_state.rb=rb; st.session_state.bb=bb
-        st.session_state.ocr_done=True
+        st.session_state.ocr_done=True; st.session_state.ocr_timing=timing; st.session_state.panel_locs=panel_locs; st.session_state.image_pair_id=image_pair_id
         st.rerun()
     if "rows" in st.session_state:
-        st.success("OCR 已完成并缓存。下面修改式神、属性、御魂、核验状态或密码都不会再次运行 OCR；属性变化只重算对应式神的御魂候选。")
+        st.success("OCR 已完成。之后修改式神、属性、御魂、核验状态、备注或密码都不会再次运行 OCR；属性变化只重算对应式神的御魂候选。")
+        timing=st.session_state.get("ocr_timing",{})
+        if timing:
+            with st.expander("⏱️ 本次识别性能诊断",expanded=False):
+                cols=st.columns(min(5,len(timing)))
+                for i,(k,v) in enumerate(timing.items()): cols[i%len(cols)].metric(k,f"{v:.2f}s")
+                st.caption("V3.3 先自动定位『阵容详情』主面板，再在面板内部归一化坐标；正常路径每张截图仅 1 次 OCR。")
+            locs=st.session_state.get("panel_locs",{})
+            if locs:
+                with st.expander("🎯 查看主面板定位结果",expanded=False):
+                    pc1,pc2=st.columns(2)
+                    for side,col,bts in (("RED",pc1,st.session_state.rb),("BLUE",pc2,st.session_state.bb)):
+                        loc=locs.get(side,{})
+                        with col:
+                            st.caption(f'{side} · 定位置信度 {loc.get("confidence",0):.1%} · bbox {loc.get("bbox")}')
+                            st.image(cv2.cvtColor(draw_panel_preview(decode(bts),loc),cv2.COLOR_BGR2RGB),width="stretch")
+        missing=sum(len(r.get("ocr_missing_fields",[])) for r in st.session_state.rows)
+        if missing: st.warning(f"整图 OCR 有 {missing}/80 个属性未识别。V3.3 为保证速度不会自动逐格重试，请在下方人工补充这些值。")
         st.divider(); left,right=st.columns(2)
         for side,col in (("RED",left),("BLUE",right)):
             with col:

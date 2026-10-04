@@ -1,4 +1,4 @@
-# 阴阳师 · 对弈竞猜数据台 v3
+# 阴阳师 · 对弈竞猜数据台 v3.3
 
 面向固定“阵容详情”截图的数据采集工具：红/蓝双方截图 → ROI OCR → 式神名称约束 → 八维面板匹配 `duel-panels.json` 反推御魂 → 人工核验 → 密码保护保存 → 赛后补录真实胜负 → CSV/JSONL 导出。
 
@@ -95,3 +95,22 @@ The fixed-layout OCR pipeline now packs the five name ROIs and forty numeric ROI
 After OCR, changing a shikigami or any of its eight stats only recomputes soul evidence for that single unit. Changing a soul manually, checking confirmation, entering a password, changing notes/date/winner, or navigating the page does not run OCR again.
 
 Deployment runtime is pinned to Python 3.12 via `.python-version` for better OpenCV/ONNX compatibility on Streamlit Community Cloud.
+
+## V3.2 performance architecture
+
+V3.2 removes automatic per-cell OCR fallback. In the normal recognition path it runs RapidOCR exactly twice per match: once for the full red screenshot and once for the full blue screenshot. OCR boxes are mapped back to the fixed 5-column x 9-row layout by coordinates. Missing cells remain editable for human review instead of triggering dozens of extra OCR calls.
+
+The recognition page now reports real stage progress (0-100%) and stores timing diagnostics for OCR model initialization, red-side OCR, blue-side OCR, coordinate parsing, soul matching, and total elapsed time. Normal Streamlit widget reruns do not invoke OCR again. Editing one unit only recalculates that unit's soul evidence.
+
+## V3.3：自适应主面板定位
+
+V3.3 不再假设整张截图具有固定分辨率或固定长宽比。识别前先利用「阵容详情」表格的纵横网格几何结构定位主面板，裁剪后统一映射到 1000×491 的内部坐标系，再执行 5 列 × 8 属性解析。
+
+- 支持不同截图分辨率和长宽比；背景 UI 可以有不同宽度。
+- 主面板定位失败时停止 OCR，不会在错误区域强行识别。
+- 识别进度新增红/蓝双方主面板定位阶段。
+- 性能诊断新增面板定位耗时。
+- 「查看主面板定位结果」会显示检测框和定位置信度，便于人工核验。
+- OCR 正常路径仍为每张截图一次，共两次，不恢复逐格 fallback。
+
+已用项目内原始 1026×542 左右截图，以及 1536×706 新截图验证主面板几何定位。
