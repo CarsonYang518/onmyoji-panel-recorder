@@ -249,13 +249,51 @@ def edit_unit(r,key):
         recalc(r); st.rerun()
     level=r.get("soul_level","低")
     st.caption(f'推断：{r.get("soul_inferred") or "无法确定"} · 证据 {level} · score {r.get("soul_match_score",0):.3f} · 属性 margin {r.get("soul_margin",0):.3f}')
-    if r.get("soul_candidates"):st.caption("属性候选："+r["soul_candidates"])
+    def _candidate_buttons(title, candidate_text, prefix):
+        """Render unique soul candidates as one-click choices without rerunning OCR/matching."""
+        if not candidate_text:
+            return
+        parsed=[]
+        seen=set()
+        for part in str(candidate_text).split("|"):
+            part=part.strip()
+            if not part:
+                continue
+            name, sep, score_text = part.rpartition(":")
+            name=name.strip() if sep else part
+            score_text=score_text.strip() if sep else ""
+            if not name or name in seen or name not in DB.souls:
+                continue
+            seen.add(name)
+            parsed.append((name,score_text))
+        if not parsed:
+            return
+        st.caption(title)
+        cols=st.columns(min(len(parsed),4))
+        def choose_soul(chosen):
+            # Callback runs before the next script rerun, so changing the selectbox
+            # session-state value here is safe. No OCR or image matching is invoked.
+            st.session_state[soul_key]=chosen
+        for i,(candidate,score_text) in enumerate(parsed):
+            label=f"{candidate} {score_text}".strip()
+            cols[i % len(cols)].button(
+                label,
+                key=f"{key}_{prefix}_{i}_{candidate}",
+                use_container_width=True,
+                on_click=choose_soul,
+                args=(candidate,),
+            )
+
+    if r.get("soul_candidates"):
+        _candidate_buttons("属性候选（点击即可填入）：",r["soul_candidates"],"attrcand")
     if r.get("soul_attribute_pred"):
         st.caption(f'属性预测：{r.get("soul_attribute_pred")} · {r.get("soul_attribute_score",0):.3f}')
         if not r.get("soul_attribute_reliable"):
             st.caption("↳ 属性证据不足：高 score 但候选区分度（margin）不足时不会自动定案。")
     if r.get("soul_image_pred"):
         st.caption(f'图片预测：{r.get("soul_image_pred")} · {r.get("soul_image_score",0):.3f} · Top-K {r.get("soul_image_votes",0)}/{r.get("soul_image_top_k_n",0)} 票 · 历史图库总样本 {r.get("soul_image_n",0)}')
+        if r.get("soul_image_candidates"):
+            _candidate_buttons("图片候选（点击即可填入）：",r["soul_image_candidates"],"imgcand")
         if not r.get("soul_image_reliable"):
             st.caption("↳ 图片证据不足：当前不会单独用于自动定案。")
     if r.get("soul_evidence_conflict"):
