@@ -33,9 +33,22 @@ def decode(b):return cv2.imdecode(np.frombuffer(b,np.uint8),cv2.IMREAD_COLOR)
 
 
 @st.cache_data(ttl=300,show_spinner=False)
-def cached_soul_gallery(_version="v1"):
-    """Cache private historical crops so normal Streamlit reruns do not redownload them."""
-    return STORE.load_soul_gallery(limit=600)
+def cached_soul_gallery_features():
+    """Download/decode each historical crop once, then cache its feature matrix."""
+    gallery=STORE.load_soul_gallery(limit=600)
+    labels=[]; feats=[]
+    for x in gallery:
+        try:
+            arr=np.frombuffer(x["image_bytes"],np.uint8)
+            im=cv2.imdecode(arr,cv2.IMREAD_COLOR)
+            f=_soul_feature(im)
+            if f is not None:
+                labels.append(x["soul"]); feats.append(f)
+        except Exception:
+            continue
+    if not feats:
+        return {"labels":[],"features":np.empty((0,0),dtype=np.float32)}
+    return {"labels":labels,"features":np.ascontiguousarray(np.vstack(feats),dtype=np.float32)}
 
 def _soul_feature(img):
     if img is None or img.size==0:return None
@@ -43,97 +56,87 @@ def _soul_feature(img):
     g=cv2.resize(g,(64,48),interpolation=cv2.INTER_AREA)
     g=cv2.equalizeHist(g)
     edge=cv2.Canny(g,45,130)
-    # Appearance + shape. Standardize to reduce brightness/theme variation.
     a=g.astype(np.float32).reshape(-1); e=edge.astype(np.float32).reshape(-1)/255.0
     a=(a-a.mean())/(a.std()+1e-6)
-    v=np.concatenate([a,e*1.5]); n=np.linalg.norm(v)
+    v=np.concatenate([a,e*1.5]).astype(np.float32); n=np.linalg.norm(v)
     return v/n if n>0 else v
 
 def _image_soul_prediction(crop,gallery,topk=7):
-    q=_soul_feature(crop)
-    if q is None or not gallery:return {"soul":"","score":0.0,"n":0,"votes":0,"candidates":[]}
-    scored=[]
-    for x in gallery:
-        try:
-            arr=np.frombuffer(x["image_bytes"],np.uint8); im=cv2.imdecode(arr,cv2.IMREAD_COLOR); f=_soul_feature(im)
-            if f is None:continue
-            # cosine [-1,1] -> [0,1]
-            sim=float(np.clip((float(np.dot(q,f))+1.0)/2.0,0,1))
-            scored.append((sim,x["soul"]))
-        except Exception:continue
-    scored.sort(reverse=True); top=scored[:topk]
-    if not top:return {"soul":"","score":0.0,"n":0,"votes":0,"candidates":[]}
+    q=_soul_feature(crop); feats=gallery.get("features") if gallery else None; labels=gallery.get("labels",[]) if gallery else []
+    if q is None or feats is None or feats.size==0:
+        return {"soul":"","score":0.0,"n":0,"votes":0,"top_k_n":0,"candidates":[]}
+    # All historical similarities in one vectorized matrix-vector operation.
+    sims=np.clip((feats @ q + 1.0)/2.0,0.0,1.0)
+    k=min(int(topk),len(sims)); idx=np.argpartition(sims,-k)[-k:]; idx=idx[np.argsort(sims[idx])[::-1]]
     agg={}
-    for sim,label in top:
+    for i in idx:
+        label=labels[int(i)]; sim=float(sims[int(i)])
         z=agg.setdefault(label,{"sims":[],"votes":0}); z["sims"].append(sim); z["votes"]+=1
     cand=[]
     for label,z in agg.items():
-        # Top similarities + voting consistency; avoids one accidental nearest neighbour dominating.
-        sims=sorted(z["sims"],reverse=True)[:3]
-        mean=float(np.mean(sims)); vote=z["votes"]/len(top)
+        ss=sorted(z["sims"],reverse=True)[:3]; mean=float(np.mean(ss)); vote=z["votes"]/k
         score=mean*(.68+.32*vote)
         cand.append({"soul":label,"score":score,"similarity":mean,"votes":z["votes"]})
     cand.sort(key=lambda x:(x["score"],x["votes"]),reverse=True); b=cand[0]
-    return {"soul":b["soul"],"score":round(b["score"],3),"n":len(scored),"votes":b["votes"],"candidates":cand[:5]}
+    return {"soul":b["soul"],"score":round(b["score"],3),"n":len(labels),"votes":b["votes"],"top_k_n":k,"candidates":cand[:5]}
+
+def _combine_soul_evidence(r, attr_soul, attr_score, attr_margin):
+    """Conservative decision: a high match score without margin is not discriminative evidence."""
+    img_soul=r.get("soul_image_pred",""); img_score=float(r.get("soul_image_score",0) or 0)
+    img_votes=int(r.get("soul_image_votes",0) or 0); img_n=int(r.get("soul_image_n",0) or 0)
+    attr_ready=bool(attr_soul) and attr_score>=.80 and attr_margin>=.05
+    image_ready=bool(img_soul) and img_n>=3 and img_votes>=2 and img_score>=.72
+    conflict=attr_ready and image_ready and attr_soul!=img_soul
+    if attr_ready and image_ready and not conflict:
+        return attr_soul, round(.55*attr_score+.45*img_score,3), "高", False, attr_ready, image_ready
+    if conflict:
+        return "", 0.0, "低", True, attr_ready, image_ready
+    if attr_ready:
+        return attr_soul, round(attr_score,3), "中", False, attr_ready, image_ready
+    if image_ready:
+        return img_soul, round(img_score,3), "中", False, attr_ready, image_ready
+    return "", 0.0, "低", False, attr_ready, image_ready
 
 def attach_image_soul_evidence(rows,red_img,blue_img,panel_locs):
-    """Fuse historical image evidence with the existing attribute evidence."""
-    try: gallery=cached_soul_gallery(DB.version)
+    """Add cached image evidence, then make a conservative joint decision."""
+    try: gallery=cached_soul_gallery_features()
     except Exception as e:
-        gallery=[]
+        gallery={"labels":[],"features":np.empty((0,0),dtype=np.float32)}
         for r in rows:r["soul_image_error"]=str(e)
-    by_side={"RED":red_img,"BLUE":blue_img}
+    # Normalize each side once, not once per unit.
+    panels={}
+    for side,img in (("RED",red_img),("BLUE",blue_img)):
+        try: panels[side],_=normalize_panel(img,panel_locs[side])
+        except Exception: panels[side]=None
     for r in rows:
-        attr_soul=r.get("soul_inferred",""); attr_score=float(r.get("soul_match_score",0) or 0)
+        attr_soul=r.get("soul_inferred",""); attr_score=float(r.get("soul_match_score",0) or 0); attr_margin=float(r.get("soul_margin",0) or 0)
         r["soul_attribute_pred"]=attr_soul; r["soul_attribute_score"]=attr_score
         try:
-            panel,_=normalize_panel(by_side[r["side"]],panel_locs[r["side"]])
+            panel=panels.get(r["side"])
             x1,x2=COLS[int(r["slot"])-1]; y1,y2=SOUL_Y; crop=panel[y1:y2,x1+38:x2-38]
             ip=_image_soul_prediction(crop,gallery)
         except Exception as e:
-            ip={"soul":"","score":0.0,"n":0,"votes":0,"candidates":[]}; r["soul_image_error"]=str(e)
-        r["soul_image_pred"]=ip["soul"]; r["soul_image_score"]=ip["score"]; r["soul_image_votes"]=ip["votes"]; r["soul_image_n"]=ip["n"]
+            ip={"soul":"","score":0.0,"n":0,"votes":0,"top_k_n":0,"candidates":[]}; r["soul_image_error"]=str(e)
+        r["soul_image_pred"]=ip["soul"]; r["soul_image_score"]=ip["score"]; r["soul_image_votes"]=ip["votes"]; r["soul_image_n"]=ip["n"]; r["soul_image_top_k_n"]=ip["top_k_n"]
         r["soul_image_candidates"]=" | ".join(f'{x["soul"]}:{x["score"]:.3f}' for x in ip["candidates"])
-        # Require enough historical support before image evidence can alter the automatic answer.
-        image_ready=ip["n"]>=3 and ip["votes"]>=2 and ip["score"]>=.72
-        combined=attr_soul; combined_score=attr_score; conflict=False
-        if image_ready:
-            if not attr_soul:
-                combined,combined_score=ip["soul"],ip["score"]
-            elif ip["soul"]==attr_soul:
-                combined_score=.55*attr_score+.45*ip["score"]
-            else:
-                conflict=True
-                # Conservative conflict rule: image must be substantially stronger to override attributes.
-                if ip["score"] >= attr_score+.12 and ip["score"]>=.84:
-                    combined,combined_score=ip["soul"],.45*attr_score+.55*ip["score"]
-        r["soul_evidence_conflict"]=conflict
-        r["soul_inferred"]=combined; r["soul"]=combined; r["soul_match_score"]=round(combined_score,3)
+        combined,score,level,conflict,ar,ir=_combine_soul_evidence(r,attr_soul,attr_score,attr_margin)
+        r["soul_attribute_reliable"]=ar; r["soul_image_reliable"]=ir; r["soul_evidence_conflict"]=conflict
+        r["soul_inferred"]=combined; r["soul"]=combined; r["soul_match_score"]=score; r["soul_level"]=level
     return rows
 
 def recalc(r):
-    old_inferred=r.get("soul_inferred","")
-    old_soul=r.get("soul","")
+    old_inferred=r.get("soul_inferred",""); old_soul=r.get("soul","")
     ev=DB.evidence(r.get("name",""),r)
-    attr_soul=ev["soul"]; attr_score=float(ev["score"] or 0)
+    attr_soul=ev["soul"]; attr_score=float(ev["score"] or 0); attr_margin=float(ev["margin"] or 0)
     r["soul_attribute_pred"]=attr_soul; r["soul_attribute_score"]=attr_score
-    combined=attr_soul; combined_score=attr_score
-    img_soul=r.get("soul_image_pred",""); img_score=float(r.get("soul_image_score",0) or 0)
-    image_ready=int(r.get("soul_image_n",0) or 0)>=3 and int(r.get("soul_image_votes",0) or 0)>=2 and img_score>=.72
-    conflict=False
-    if image_ready:
-        if not attr_soul: combined,combined_score=img_soul,img_score
-        elif img_soul==attr_soul: combined_score=.55*attr_score+.45*img_score
-        else:
-            conflict=True
-            if img_score>=attr_score+.12 and img_score>=.84: combined,combined_score=img_soul,.45*attr_score+.55*img_score
-    r["soul_evidence_conflict"]=conflict
-    r["soul_inferred"]=combined; r["soul_match_score"]=round(combined_score,3); r["soul_margin"]=ev["margin"]
-    r["soul_level"]=ev["level"]; r["reference_record_id"]=ev["reference_record_id"]; r["suggestions"]=ev["suggestions"]
+    combined,score,level,conflict,ar,ir=_combine_soul_evidence(r,attr_soul,attr_score,attr_margin)
+    r["soul_attribute_reliable"]=ar; r["soul_image_reliable"]=ir; r["soul_evidence_conflict"]=conflict
+    r["soul_inferred"]=combined; r["soul_match_score"]=score; r["soul_margin"]=attr_margin; r["soul_level"]=level
+    r["reference_record_id"]=ev["reference_record_id"]; r["suggestions"]=ev["suggestions"]
     r["soul_candidates"]=" | ".join(f'{x["soul"]}:{x["score"]:.3f}' for x in ev["candidates"])
     auto_changed=False
     if not old_soul or old_soul==old_inferred:
-        r["soul"]=ev["soul"]; auto_changed=(old_soul!=r["soul"])
+        r["soul"]=combined; auto_changed=(old_soul!=r["soul"])
     r["_match_signature"]=(r.get("name","")+"",)+tuple(r.get(f) for f in FIELDS)
     return auto_changed
 
@@ -245,12 +248,16 @@ def edit_unit(r,key):
     if st.button("重新匹配本式神御魂",key=f"{key}_recalc",use_container_width=True):
         recalc(r); st.rerun()
     level=r.get("soul_level","低")
-    st.caption(f'推断：{r.get("soul_inferred") or "—"} · 证据 {level} · score {r.get("soul_match_score",0):.3f} · margin {r.get("soul_margin",0):.3f}')
-    if r.get("soul_candidates"):st.caption("候选："+r["soul_candidates"])
+    st.caption(f'推断：{r.get("soul_inferred") or "无法确定"} · 证据 {level} · score {r.get("soul_match_score",0):.3f} · 属性 margin {r.get("soul_margin",0):.3f}')
+    if r.get("soul_candidates"):st.caption("属性候选："+r["soul_candidates"])
     if r.get("soul_attribute_pred"):
         st.caption(f'属性预测：{r.get("soul_attribute_pred")} · {r.get("soul_attribute_score",0):.3f}')
+        if not r.get("soul_attribute_reliable"):
+            st.caption("↳ 属性证据不足：高 score 但候选区分度（margin）不足时不会自动定案。")
     if r.get("soul_image_pred"):
-        st.caption(f'图片预测：{r.get("soul_image_pred")} · {r.get("soul_image_score",0):.3f} · Top-K票数 {r.get("soul_image_votes",0)} · 历史样本 {r.get("soul_image_n",0)}')
+        st.caption(f'图片预测：{r.get("soul_image_pred")} · {r.get("soul_image_score",0):.3f} · Top-K {r.get("soul_image_votes",0)}/{r.get("soul_image_top_k_n",0)} 票 · 历史图库总样本 {r.get("soul_image_n",0)}')
+        if not r.get("soul_image_reliable"):
+            st.caption("↳ 图片证据不足：当前不会单独用于自动定案。")
     if r.get("soul_evidence_conflict"):
         st.warning(f'御魂证据冲突：属性→{r.get("soul_attribute_pred") or "—"}；图片→{r.get("soul_image_pred") or "—"}。请人工确认。')
     if r.get("name_warning"):
@@ -333,6 +340,8 @@ with t1:
                 try:
                     samples=build_soul_samples(mid,rows,st.session_state.rb,st.session_state.bb,st.session_state.get("panel_locs",{}))
                     n,errors=STORE.save_soul_samples(mid,samples)
+                    if n>0:
+                        cached_soul_gallery_features.clear()
                     if n==10:
                         sample_msg="；御魂图片样本 10/10 已保存"
                     else:
