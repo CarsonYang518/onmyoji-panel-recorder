@@ -31,11 +31,104 @@ if "flash_warning" in st.session_state:
 
 def decode(b):return cv2.imdecode(np.frombuffer(b,np.uint8),cv2.IMREAD_COLOR)
 
+
+@st.cache_data(ttl=300,show_spinner=False)
+def cached_soul_gallery(_version="v1"):
+    """Cache private historical crops so normal Streamlit reruns do not redownload them."""
+    return STORE.load_soul_gallery(limit=600)
+
+def _soul_feature(img):
+    if img is None or img.size==0:return None
+    g=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY) if img.ndim==3 else img.copy()
+    g=cv2.resize(g,(64,48),interpolation=cv2.INTER_AREA)
+    g=cv2.equalizeHist(g)
+    edge=cv2.Canny(g,45,130)
+    # Appearance + shape. Standardize to reduce brightness/theme variation.
+    a=g.astype(np.float32).reshape(-1); e=edge.astype(np.float32).reshape(-1)/255.0
+    a=(a-a.mean())/(a.std()+1e-6)
+    v=np.concatenate([a,e*1.5]); n=np.linalg.norm(v)
+    return v/n if n>0 else v
+
+def _image_soul_prediction(crop,gallery,topk=7):
+    q=_soul_feature(crop)
+    if q is None or not gallery:return {"soul":"","score":0.0,"n":0,"votes":0,"candidates":[]}
+    scored=[]
+    for x in gallery:
+        try:
+            arr=np.frombuffer(x["image_bytes"],np.uint8); im=cv2.imdecode(arr,cv2.IMREAD_COLOR); f=_soul_feature(im)
+            if f is None:continue
+            # cosine [-1,1] -> [0,1]
+            sim=float(np.clip((float(np.dot(q,f))+1.0)/2.0,0,1))
+            scored.append((sim,x["soul"]))
+        except Exception:continue
+    scored.sort(reverse=True); top=scored[:topk]
+    if not top:return {"soul":"","score":0.0,"n":0,"votes":0,"candidates":[]}
+    agg={}
+    for sim,label in top:
+        z=agg.setdefault(label,{"sims":[],"votes":0}); z["sims"].append(sim); z["votes"]+=1
+    cand=[]
+    for label,z in agg.items():
+        # Top similarities + voting consistency; avoids one accidental nearest neighbour dominating.
+        sims=sorted(z["sims"],reverse=True)[:3]
+        mean=float(np.mean(sims)); vote=z["votes"]/len(top)
+        score=mean*(.68+.32*vote)
+        cand.append({"soul":label,"score":score,"similarity":mean,"votes":z["votes"]})
+    cand.sort(key=lambda x:(x["score"],x["votes"]),reverse=True); b=cand[0]
+    return {"soul":b["soul"],"score":round(b["score"],3),"n":len(scored),"votes":b["votes"],"candidates":cand[:5]}
+
+def attach_image_soul_evidence(rows,red_img,blue_img,panel_locs):
+    """Fuse historical image evidence with the existing attribute evidence."""
+    try: gallery=cached_soul_gallery(DB.version)
+    except Exception as e:
+        gallery=[]
+        for r in rows:r["soul_image_error"]=str(e)
+    by_side={"RED":red_img,"BLUE":blue_img}
+    for r in rows:
+        attr_soul=r.get("soul_inferred",""); attr_score=float(r.get("soul_match_score",0) or 0)
+        r["soul_attribute_pred"]=attr_soul; r["soul_attribute_score"]=attr_score
+        try:
+            panel,_=normalize_panel(by_side[r["side"]],panel_locs[r["side"]])
+            x1,x2=COLS[int(r["slot"])-1]; y1,y2=SOUL_Y; crop=panel[y1:y2,x1+38:x2-38]
+            ip=_image_soul_prediction(crop,gallery)
+        except Exception as e:
+            ip={"soul":"","score":0.0,"n":0,"votes":0,"candidates":[]}; r["soul_image_error"]=str(e)
+        r["soul_image_pred"]=ip["soul"]; r["soul_image_score"]=ip["score"]; r["soul_image_votes"]=ip["votes"]; r["soul_image_n"]=ip["n"]
+        r["soul_image_candidates"]=" | ".join(f'{x["soul"]}:{x["score"]:.3f}' for x in ip["candidates"])
+        # Require enough historical support before image evidence can alter the automatic answer.
+        image_ready=ip["n"]>=3 and ip["votes"]>=2 and ip["score"]>=.72
+        combined=attr_soul; combined_score=attr_score; conflict=False
+        if image_ready:
+            if not attr_soul:
+                combined,combined_score=ip["soul"],ip["score"]
+            elif ip["soul"]==attr_soul:
+                combined_score=.55*attr_score+.45*ip["score"]
+            else:
+                conflict=True
+                # Conservative conflict rule: image must be substantially stronger to override attributes.
+                if ip["score"] >= attr_score+.12 and ip["score"]>=.84:
+                    combined,combined_score=ip["soul"],.45*attr_score+.55*ip["score"]
+        r["soul_evidence_conflict"]=conflict
+        r["soul_inferred"]=combined; r["soul"]=combined; r["soul_match_score"]=round(combined_score,3)
+    return rows
+
 def recalc(r):
     old_inferred=r.get("soul_inferred","")
     old_soul=r.get("soul","")
     ev=DB.evidence(r.get("name",""),r)
-    r["soul_inferred"]=ev["soul"]; r["soul_match_score"]=ev["score"]; r["soul_margin"]=ev["margin"]
+    attr_soul=ev["soul"]; attr_score=float(ev["score"] or 0)
+    r["soul_attribute_pred"]=attr_soul; r["soul_attribute_score"]=attr_score
+    combined=attr_soul; combined_score=attr_score
+    img_soul=r.get("soul_image_pred",""); img_score=float(r.get("soul_image_score",0) or 0)
+    image_ready=int(r.get("soul_image_n",0) or 0)>=3 and int(r.get("soul_image_votes",0) or 0)>=2 and img_score>=.72
+    conflict=False
+    if image_ready:
+        if not attr_soul: combined,combined_score=img_soul,img_score
+        elif img_soul==attr_soul: combined_score=.55*attr_score+.45*img_score
+        else:
+            conflict=True
+            if img_score>=attr_score+.12 and img_score>=.84: combined,combined_score=img_soul,.45*attr_score+.55*img_score
+    r["soul_evidence_conflict"]=conflict
+    r["soul_inferred"]=combined; r["soul_match_score"]=round(combined_score,3); r["soul_margin"]=ev["margin"]
     r["soul_level"]=ev["level"]; r["reference_record_id"]=ev["reference_record_id"]; r["suggestions"]=ev["suggestions"]
     r["soul_candidates"]=" | ".join(f'{x["soul"]}:{x["score"]:.3f}' for x in ev["candidates"])
     auto_changed=False
@@ -80,7 +173,9 @@ def recognize_pair_with_progress(red_bytes: bytes, blue_bytes: bytes):
     step(84,"在主面板归一化坐标中解析 10 个式神与 80 项面板")
     t=time.perf_counter(); rows=ocr.parse_items(red_items,"RED",DB)+ocr.parse_items(blue_items,"BLUE",DB); timing["坐标解析"]=time.perf_counter()-t
     step(91,"计算御魂候选")
-    t=time.perf_counter(); rows=ocr.attach_soul_evidence(rows,DB); timing["御魂候选"]=time.perf_counter()-t
+    t=time.perf_counter(); rows=ocr.attach_soul_evidence(rows,DB)
+    rows=attach_image_soul_evidence(rows,red_img,blue_img,{"RED":red_loc,"BLUE":blue_loc})
+    timing["御魂候选"]=time.perf_counter()-t
     step(98,"整理识别结果")
     timing["总耗时"]=time.perf_counter()-t0
     progress.progress(100,text="100% · 识别完成")
@@ -152,6 +247,17 @@ def edit_unit(r,key):
     level=r.get("soul_level","低")
     st.caption(f'推断：{r.get("soul_inferred") or "—"} · 证据 {level} · score {r.get("soul_match_score",0):.3f} · margin {r.get("soul_margin",0):.3f}')
     if r.get("soul_candidates"):st.caption("候选："+r["soul_candidates"])
+    if r.get("soul_attribute_pred"):
+        st.caption(f'属性预测：{r.get("soul_attribute_pred")} · {r.get("soul_attribute_score",0):.3f}')
+    if r.get("soul_image_pred"):
+        st.caption(f'图片预测：{r.get("soul_image_pred")} · {r.get("soul_image_score",0):.3f} · Top-K票数 {r.get("soul_image_votes",0)} · 历史样本 {r.get("soul_image_n",0)}')
+    if r.get("soul_evidence_conflict"):
+        st.warning(f'御魂证据冲突：属性→{r.get("soul_attribute_pred") or "—"}；图片→{r.get("soul_image_pred") or "—"}。请人工确认。')
+    if r.get("name_warning"):
+        st.warning(r["name_warning"])
+        suggested=r.get("name_suggested","")
+        if suggested and st.button(f"改为 {suggested}",key=f"{key}_namefix",use_container_width=True):
+            r["name"]=suggested; st.session_state[f"{key}_name"]=suggested; recalc(r); st.rerun()
     sug=r.get("suggestions") or {}
     if sug:
         st.warning("疑似 OCR 异常："+"；".join(f"{f.upper()} {r.get(f)} → {v:g}" for f,v in sug.items()))

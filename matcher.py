@@ -17,14 +17,80 @@ class PanelDB:
         for r in self.rows:
             n=str(r.get("name","")).strip()
             if n: self.by_name.setdefault(n,[]).append(r)
+        # Automatically discover names such as 酒吞童子 < 鬼王酒吞童子.
+        self.related_names={n:[] for n in self.names}
+        for a in self.names:
+            for b in self.names:
+                if a != b and (a in b or b in a): self.related_names[a].append(b)
+
+    @staticmethod
+    def _norm_name(raw):
+        return (raw or "").strip().replace(" ","").replace("·","")
 
     def correct_name(self, raw: str, topk=5):
-        raw=(raw or "").strip().replace(" ","")
+        """Text-only correction. Exact legal names always win."""
+        raw=self._norm_name(raw)
         if not raw: return "",0.0,[]
         if raw in self.by_name: return raw,1.0,[(raw,1.0)]
         hits=process.extract(raw,self.names,scorer=fuzz.WRatio,limit=topk)
         c=[(h[0],h[1]/100.0) for h in hits]
         return (c[0][0],c[0][1],c) if c else (raw,0.0,[])
+
+    def name_panel_score(self,name,panel):
+        """Best 8-stat agreement for a shikigami across all reference builds."""
+        best=0.0
+        for rec in self.by_name.get(name,[]):
+            score,_,used,_=self.compare_record(panel,rec)
+            if used >= 4: best=max(best,score)
+        return best
+
+    def resolve_name(self,raw,panel,topk=5):
+        """Resolve OCR name with stats while protecting exact legal short names.
+
+        Exact OCR is never silently replaced. If a related longer/shorter legal name
+        fits the stats much better, it is returned as a warning suggestion only.
+        Non-exact OCR uses text + panel agreement to choose among candidates.
+        """
+        raw=self._norm_name(raw)
+        text_name,text_score,text_candidates=self.correct_name(raw,topk=max(topk,8))
+        if not raw:
+            return {"name":"","score":0.0,"candidates":[],"warning":"","suggested_name":""}
+
+        if raw in self.by_name:
+            base_panel=self.name_panel_score(raw,panel)
+            alternatives=[]
+            for n in self.related_names.get(raw,[]):
+                ps=self.name_panel_score(n,panel)
+                alternatives.append((n,ps))
+            alternatives.sort(key=lambda x:x[1],reverse=True)
+            suggested=""; warning=""
+            if alternatives:
+                n,ps=alternatives[0]
+                # Deliberately conservative: exact OCR remains authoritative.
+                if ps >= .88 and ps-base_panel >= .16:
+                    suggested=n
+                    warning=f'OCR 精确识别为「{raw}」，但属性明显更符合「{n}」({ps:.3f} vs {base_panel:.3f})，请人工确认。'
+            return {"name":raw,"score":1.0,"candidates":[(raw,1.0)],
+                    "warning":warning,"suggested_name":suggested,"panel_score":base_panel}
+
+        # Candidate pool: fuzzy hits plus substring-related names. No hard-coded names.
+        pool={n:s for n,s in text_candidates}
+        for n in self.names:
+            if raw in n or n in raw:
+                pool[n]=max(pool.get(n,0.0),fuzz.WRatio(raw,n)/100.0)
+        ranked=[]
+        for n,ts in pool.items():
+            ps=self.name_panel_score(n,panel)
+            # Text remains primary; stats break ambiguous/partial OCR cases.
+            combined=.68*ts+.32*ps
+            ranked.append({"name":n,"text":ts,"panel":ps,"score":combined})
+        ranked.sort(key=lambda x:(x["score"],x["text"],x["panel"]),reverse=True)
+        if not ranked:
+            return {"name":text_name,"score":text_score,"candidates":text_candidates,"warning":"","suggested_name":""}
+        best=ranked[0]
+        return {"name":best["name"],"score":best["score"],
+                "candidates":[(x["name"],x["score"]) for x in ranked[:topk]],
+                "warning":"","suggested_name":"","panel_score":best["panel"]}
 
     @staticmethod
     def ref_values(v, field):

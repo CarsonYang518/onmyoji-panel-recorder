@@ -101,6 +101,45 @@ class Store:
             body=e.read().decode("utf-8",errors="replace")
             raise RuntimeError(f"Storage HTTP {e.code}: {body}") from e
 
+    def _download_storage(self,path):
+        """Download one object from the private soul-icons bucket using the server secret."""
+        base=self._secret("SUPABASE_URL").rstrip("/")
+        key=self._secret("SUPABASE_SECRET_KEY")
+        if not base or not key:
+            raise RuntimeError("未配置 SUPABASE_URL / SUPABASE_SECRET_KEY")
+        encoded="/".join(quote(x,safe="") for x in path.split("/"))
+        url=f"{base}/storage/v1/object/authenticated/soul-icons/{encoded}"
+        req=Request(url,method="GET",headers={"apikey":key,"User-Agent":"onmyoji-panel-recorder/1.0"})
+        try:
+            with urlopen(req,timeout=30) as resp:
+                return resp.read()
+        except HTTPError as e:
+            body=e.read().decode("utf-8",errors="replace")
+            raise RuntimeError(f"Storage HTTP {e.code}: {body}") from e
+
+    def soul_samples(self,limit=600):
+        """Return recent human-labelled soul image metadata."""
+        if self.backend!="postgres": return pd.DataFrame()
+        limit=max(1,min(int(limit),3000))
+        return self._read(f"""SELECT sample_id,match_id,side,slot,shikigami_name,soul_confirmed,soul_auto,
+                              image_path,panel_confidence,created_at
+                       FROM soul_samples
+                       WHERE soul_confirmed IS NOT NULL AND soul_confirmed <> ''
+                       ORDER BY created_at DESC LIMIT {limit}""")
+
+    def load_soul_gallery(self,limit=600):
+        """Load labelled private-bucket crops. Bad/missing objects are skipped."""
+        meta=self.soul_samples(limit); out=[]
+        if meta.empty: return out
+        for _,r in meta.iterrows():
+            try:
+                out.append({"soul":str(r.soul_confirmed),"path":str(r.image_path),
+                            "shikigami":str(r.shikigami_name or ""),
+                            "image_bytes":self._download_storage(str(r.image_path))})
+            except Exception:
+                continue
+        return out
+
     def save_soul_samples(self,mid,samples):
         """Upload confirmed soul crops, then index successful uploads in soul_samples.
 
