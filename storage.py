@@ -88,8 +88,9 @@ class Store:
         encoded="/".join(quote(x,safe="") for x in path.split("/"))
         url=f"{base}/storage/v1/object/soul-icons/{encoded}"
         req=Request(url,data=data,method="POST",headers={
-            "Authorization":f"Bearer {key}","apikey":key,
-            "Content-Type":content_type,"x-upsert":"true"})
+            "apikey":key,
+            "Content-Type":content_type,"x-upsert":"true",
+            "User-Agent":"onmyoji-panel-recorder/1.0"})
         with urlopen(req,timeout=30) as resp:
             if not (200 <= resp.status < 300):
                 raise RuntimeError(f"Storage upload HTTP {resp.status}")
@@ -152,7 +153,14 @@ class Store:
               "COMPLETE" if meta.get("winner") else "PENDING",paths["RED"],paths["BLUE"],meta.get("notes",""),meta.get("reference_version",""))
         with self.con() as c:
             cur=c.cursor() if self.backend=="postgres" else c
-            cur.execute(f"INSERT INTO matches ({','.join(MATCH_COLS)}) VALUES ({self._ph(len(MATCH_COLS))})",vals)
+            if self.backend=="postgres":
+                cur.execute(f"""INSERT INTO matches ({','.join(MATCH_COLS)}) VALUES ({self._ph(len(MATCH_COLS))})
+                               ON CONFLICT (match_id) DO UPDATE SET
+                               updated_at=EXCLUDED.updated_at,match_date=EXCLUDED.match_date,match_time=EXCLUDED.match_time,
+                               winner=EXCLUDED.winner,status=EXCLUDED.status,notes=EXCLUDED.notes,
+                               reference_version=EXCLUDED.reference_version""",vals)
+            else:
+                cur.execute(f"INSERT OR REPLACE INTO matches ({','.join(MATCH_COLS)}) VALUES ({self._ph(len(MATCH_COLS))})",vals)
             self._write_units(cur,mid,rows)
         self.export(); return mid
 

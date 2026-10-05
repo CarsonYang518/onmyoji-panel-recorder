@@ -22,6 +22,13 @@ def get_db(sig): return PanelDB(sig[0])
 @st.cache_resource
 def get_ocr(): return PanelOCR()
 DB=get_db(file_sig(DATA)); STORE=Store(ROOT/"storage")
+
+# Flash messages survive st.rerun(), then disappear after being shown once.
+if "flash_success" in st.session_state:
+    st.success(st.session_state.pop("flash_success"))
+if "flash_warning" in st.session_state:
+    st.warning(st.session_state.pop("flash_warning"))
+
 def decode(b):return cv2.imdecode(np.frombuffer(b,np.uint8),cv2.IMREAD_COLOR)
 
 def recalc(r):
@@ -132,10 +139,12 @@ def edit_unit(r,key):
         auto_changed=recalc(r)
 
     souls=[""]+DB.souls; soul_key=f"{key}_soul"
-    if auto_changed and soul_key in st.session_state:
-        st.session_state[soul_key]=r.get("soul","")
-    old_soul=r.get("soul","")
-    soul=st.selectbox("御魂",souls,index=souls.index(old_soul) if old_soul in souls else 0,key=soul_key)
+    desired=r.get("soul","") if r.get("soul","") in souls else ""
+    if soul_key not in st.session_state:
+        st.session_state[soul_key]=desired
+    elif auto_changed:
+        st.session_state[soul_key]=desired
+    soul=st.selectbox("御魂",souls,key=soul_key)
     r["soul"]=soul; r["soul_manually_changed"]=bool(soul!=r.get("soul_inferred",""))
 
     if st.button("重新匹配本式神御魂",key=f"{key}_recalc",use_container_width=True):
@@ -175,6 +184,8 @@ with t1:
         clear_editor_widget_state("new_")
         st.session_state.rows=rows; st.session_state.rb=rb; st.session_state.bb=bb
         st.session_state.ocr_done=True; st.session_state.ocr_timing=timing; st.session_state.panel_locs=panel_locs; st.session_state.image_pair_id=image_pair_id
+        # Stable per image pair: repeated clicks cannot create another match row.
+        st.session_state.current_match_id=f"img-{image_pair_id}"
         st.rerun()
     if "rows" in st.session_state:
         st.success("OCR 已完成。之后修改式神、属性、御魂、核验状态、备注或密码都不会再次运行 OCR；属性变化只重算对应式神的御魂候选。")
@@ -209,19 +220,27 @@ with t1:
             if len(rows)!=10:st.error("必须有 10 个式神。")
             elif not all(x.get("confirmed") for x in rows):st.error("请人工核验并勾选全部 10 个式神。")
             else:
-                mid=STORE.save_match({"match_date":str(md),"match_time":mt,"winner":winner,"notes":notes,"reference_version":DB.version},rows,st.session_state.rb,st.session_state.bb)
-                st.success(f"比赛数据已保存 {mid}")
+                mid=st.session_state.get("current_match_id") or f'img-{st.session_state.get("image_pair_id", hashlib.sha256(st.session_state.rb+st.session_state.bb).hexdigest()[:16])}'
+                meta={"match_id":mid,"match_date":str(md),"match_time":mt,"winner":winner,"notes":notes,"reference_version":DB.version}
+                mid=STORE.save_match(meta,rows,st.session_state.rb,st.session_state.bb)
+                sample_msg=""
                 try:
                     samples=build_soul_samples(mid,rows,st.session_state.rb,st.session_state.bb,st.session_state.get("panel_locs",{}))
                     n,errors=STORE.save_soul_samples(mid,samples)
                     if n==10:
-                        st.success("御魂图片样本已保存 10/10。")
+                        sample_msg="；御魂图片样本 10/10 已保存"
                     else:
-                        st.warning(f"比赛已正常保存；御魂图片样本保存 {n}/10。")
-                        if errors: st.caption("；".join(errors[:10]))
+                        detail=("；"+"；".join(errors[:3])) if errors else ""
+                        st.session_state["flash_warning"]=f"比赛 {mid} 已保存，但御魂图片样本仅保存 {n}/10{detail}"
                 except Exception as e:
-                    st.warning(f"比赛已正常保存；御魂图片样本未保存：{e}")
-                del st.session_state["rows"]
+                    st.session_state["flash_warning"]=f"比赛 {mid} 已保存，但御魂图片样本未保存：{e}"
+                if "flash_warning" not in st.session_state:
+                    st.session_state["flash_success"]=f"比赛 {mid} 保存成功{sample_msg}。"
+                # Clear all new-match state so the refreshed page is ready for the next match.
+                clear_editor_widget_state("new_")
+                for k in ["rows","rb","bb","ocr_done","ocr_timing","panel_locs","image_pair_id","current_match_id","red","blue","save_password"]:
+                    st.session_state.pop(k,None)
+                st.rerun()
 with t2:
     m=STORE.matches(); pending=m[m.status=="PENDING"] if not m.empty else m
     if pending.empty:st.success("没有待补录结果的比赛。")
@@ -249,9 +268,15 @@ with t3:
         ok=gate("管理密码","history_password"); x,y=st.columns(2)
         if x.button("保存历史修改",type="primary",use_container_width=True,disabled=not ok):
             if not all(r.get("confirmed") for r in edited):st.error("10 个式神都必须保持人工核验状态。")
-            else:STORE.update_match(mid,{"match_date":ed,"match_time":et,"notes":en,"winner":ew},[clean_row(r) for r in edited]);st.success("修改已保存");st.rerun()
+            else:
+                STORE.update_match(mid,{"match_date":ed,"match_time":et,"notes":en,"winner":ew},[clean_row(r) for r in edited])
+                st.session_state["flash_success"]=f"比赛 {mid} 的修改已保存。"
+                st.rerun()
         confirm_delete=y.checkbox("我确认删除整场比赛",key="confirm_delete")
-        if y.button("🗑️ 删除比赛",use_container_width=True,disabled=not(ok and confirm_delete)):STORE.delete_match(mid);st.success("已删除");st.rerun()
+        if y.button("🗑️ 删除比赛",use_container_width=True,disabled=not(ok and confirm_delete)):
+            STORE.delete_match(mid)
+            st.session_state["flash_success"]=f"比赛 {mid} 已删除。"
+            st.rerun()
 with t4:
     m=STORE.matches();u=STORE.units(); a,b,c=st.columns(3);a.metric("比赛",len(m));b.metric("式神记录",len(u));c.metric("待补结果",int((m.status=="PENDING").sum()) if not m.empty else 0)
 
