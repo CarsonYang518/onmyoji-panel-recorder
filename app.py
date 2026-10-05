@@ -238,9 +238,10 @@ def edit_unit(r,key):
 
     souls=[""]+DB.souls; soul_key=f"{key}_soul"
     desired=r.get("soul","") if r.get("soul","") in souls else ""
+    # Initialize the soul widget only once. After the user makes a manual
+    # selection, the widget state is the source of truth and must never be
+    # overwritten by an automatic recalculation on a later Streamlit rerun.
     if soul_key not in st.session_state:
-        st.session_state[soul_key]=desired
-    elif auto_changed:
         st.session_state[soul_key]=desired
     soul=st.selectbox("御魂",souls,key=soul_key)
     r["soul"]=soul; r["soul_manually_changed"]=bool(soul!=r.get("soul_inferred",""))
