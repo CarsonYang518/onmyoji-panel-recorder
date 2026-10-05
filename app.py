@@ -320,152 +320,229 @@ def clean_row(r):
 st.markdown(f'<div class="hero"><h2 style="margin:0">⚔️ 阴阳师 · 对弈竞猜数据台</h2><div class="muted">Carson Yang</div><div class="confidence">参考库 {len(DB.rows)} 条 · {len(DB.names)} 式神 · {len(DB.souls)} 御魂 · version {DB.version}</div></div>',unsafe_allow_html=True)
 if not configured():st.warning("当前没有配置 SAVE_PASSWORD：可以识别和浏览，但所有写入、修改、删除均被锁定。")
 
-t1,t2,t3,t4=st.tabs(["✨ 新比赛","🏁 补录结果","🗂️ 历史管理","⬇️ 导出"])
-with t1:
-    c1,c2=st.columns(2); red=c1.file_uploader("红方阵容详情",["png","jpg","jpeg"],key="red"); blue=c2.file_uploader("蓝方阵容详情",["png","jpg","jpeg"],key="blue")
-    if red:c1.image(red,width="stretch")
-    if blue:c2.image(blue,width="stretch")
-    if red and blue and st.button("✨ 智能识别双方",type="primary",use_container_width=True):
-        rb,bb=red.getvalue(),blue.getvalue()
-        image_pair_id=hashlib.sha256(rb+bb).hexdigest()[:16]
-        # A normal widget rerun never enters this block. OCR only runs on this explicit button click.
-        try:
-            rows,timing,panel_locs=recognize_pair_with_progress(rb,bb)
-        except ValueError as e:
-            st.error(str(e)); st.stop()
-        clear_editor_widget_state("new_")
-        st.session_state.rows=rows; st.session_state.rb=rb; st.session_state.bb=bb
-        st.session_state.ocr_done=True; st.session_state.ocr_timing=timing; st.session_state.panel_locs=panel_locs; st.session_state.image_pair_id=image_pair_id
-        # Stable per image pair: repeated clicks cannot create another match row.
-        st.session_state.current_match_id=f"img-{image_pair_id}"
-        st.rerun()
-    if "rows" in st.session_state:
-        st.success("OCR 已完成。之后修改式神、属性、御魂、核验状态、备注或密码都不会再次运行 OCR；属性变化只重算对应式神的御魂候选。")
-        timing=st.session_state.get("ocr_timing",{})
-        if timing:
-            with st.expander("⏱️ 本次识别性能诊断",expanded=False):
-                cols=st.columns(min(5,len(timing)))
-                for i,(k,v) in enumerate(timing.items()): cols[i%len(cols)].metric(k,f"{v:.2f}s")
-                st.caption("V3.3 先自动定位『阵容详情』主面板，再在面板内部归一化坐标；正常路径每张截图仅 1 次 OCR。")
-            locs=st.session_state.get("panel_locs",{})
-            if locs:
-                with st.expander("🎯 查看主面板定位结果",expanded=False):
-                    pc1,pc2=st.columns(2)
-                    for side,col,bts in (("RED",pc1,st.session_state.rb),("BLUE",pc2,st.session_state.bb)):
-                        loc=locs.get(side,{})
-                        with col:
-                            st.caption(f'{side} · 定位置信度 {loc.get("confidence",0):.1%} · bbox {loc.get("bbox")}')
-                            st.image(cv2.cvtColor(draw_panel_preview(decode(bts),loc),cv2.COLOR_BGR2RGB),width="stretch")
-        missing=sum(len(r.get("ocr_missing_fields",[])) for r in st.session_state.rows)
-        if missing: st.warning(f"整图 OCR 有 {missing}/80 个属性未识别。V3.3 为保证速度不会自动逐格重试，请在下方人工补充这些值。")
-        st.divider(); left,right=st.columns(2)
-        for side,col in (("RED",left),("BLUE",right)):
-            with col:
-                st.subheader("🔴 红方" if side=="RED" else "🔵 蓝方")
-                for r in [x for x in st.session_state.rows if x["side"]==side]:
-                    with st.container(border=True): edit_unit(r,f'new_{side}_{r["slot"]}')
-        st.divider(); a,b,c=st.columns([1,1,2]); md=a.date_input("日期",date.today()); mt=b.text_input("场次/时间"); notes=c.text_input("备注")
-        winner=st.selectbox("真实结果（未知可留空）",["","RED","BLUE","DRAW","INVALID"])
-        ok=gate("保存密码","save_password")
-        if st.button("💾 保存本场",type="primary",use_container_width=True,disabled=not ok):
-            rows=[clean_row(x) for x in st.session_state.rows]
-            if len(rows)!=10:st.error("必须有 10 个式神。")
-            elif not all(x.get("confirmed") for x in rows):st.error("请人工核验并勾选全部 10 个式神。")
-            else:
-                mid=st.session_state.get("current_match_id") or f'img-{st.session_state.get("image_pair_id", hashlib.sha256(st.session_state.rb+st.session_state.bb).hexdigest()[:16])}'
-                meta={"match_id":mid,"match_date":str(md),"match_time":mt,"winner":winner,"notes":notes,"reference_version":DB.version}
-                mid=STORE.save_match(meta,rows,st.session_state.rb,st.session_state.bb)
-                sample_msg=""
-                try:
-                    samples=build_soul_samples(mid,rows,st.session_state.rb,st.session_state.bb,st.session_state.get("panel_locs",{}))
-                    n,errors=STORE.save_soul_samples(mid,samples)
-                    if n>0:
-                        cached_soul_gallery_features.clear()
-                    if n==10:
-                        sample_msg="；御魂图片样本 10/10 已保存"
-                    else:
-                        detail=("；"+"；".join(errors[:3])) if errors else ""
-                        st.session_state["flash_warning"]=f"比赛 {mid} 已保存，但御魂图片样本仅保存 {n}/10{detail}"
-                except Exception as e:
-                    st.session_state["flash_warning"]=f"比赛 {mid} 已保存，但御魂图片样本未保存：{e}"
-                if "flash_warning" not in st.session_state:
-                    st.session_state["flash_success"]=f"比赛 {mid} 保存成功{sample_msg}。"
-                # Clear all new-match state so the refreshed page is ready for the next match.
-                clear_editor_widget_state("new_")
-                for k in ["rows","rb","bb","ocr_done","ocr_timing","panel_locs","image_pair_id","current_match_id","red","blue","save_password"]:
-                    st.session_state.pop(k,None)
-                st.rerun()
-with t2:
-    m=STORE.matches(); pending=m[m.status=="PENDING"] if not m.empty else m
-    if pending.empty:st.success("没有待补录结果的比赛。")
-    else:
-        st.dataframe(pending[["match_id","match_date","match_time","notes"]],hide_index=True,width="stretch")
-        mid=st.selectbox("比赛",pending.match_id.tolist()); w=st.radio("真实结果",["RED","BLUE","DRAW","INVALID"],horizontal=True); ok=gate("管理密码","winner_password")
-        if st.button("写入结果",type="primary",disabled=not ok):STORE.update_winner(mid,w);st.success("已更新");st.rerun()
-with t3:
-    m=STORE.matches()
-    if m.empty:st.info("还没有历史数据。")
-    else:
-        q=st.text_input("搜索 match_id / 日期 / 备注")
-        view=m.copy()
-        if q:view=view[view.astype(str).apply(lambda x:x.str.contains(q,case=False,na=False)).any(axis=1)]
-        st.dataframe(view[["match_id","match_date","match_time","winner","status","notes","updated_at"]],hide_index=True,width="stretch")
-        mid=st.selectbox("选择历史比赛",view.match_id.tolist()); units=STORE.units(mid); meta=m[m.match_id==mid].iloc[0]
-        st.subheader("比赛详情")
-        edited=[]; L,R=st.columns(2)
-        for side,col in (("RED",L),("BLUE",R)):
-            with col:
-                for _,x in units[units.side==side].iterrows():
-                    r=x.to_dict(); r["confirmed"]=bool(r.get("confirmed")); r.setdefault("soul_level","")
-                    with st.container(border=True): edited.append(edit_unit(r,f'hist_{mid}_{side}_{int(r["slot"])}'))
-        ea,eb,ec=st.columns([1,1,2]); ed=ea.text_input("日期",str(meta.match_date),key="edit_date"); et=eb.text_input("时间",str(meta.match_time),key="edit_time"); en=ec.text_input("备注",str(meta.notes or ""),key="edit_notes"); ew=st.selectbox("结果",["","RED","BLUE","DRAW","INVALID"],index=["","RED","BLUE","DRAW","INVALID"].index(str(meta.winner or "")),key="edit_winner")
-        ok=gate("管理密码","history_password"); x,y=st.columns(2)
-        if x.button("保存历史修改",type="primary",use_container_width=True,disabled=not ok):
-            if not all(r.get("confirmed") for r in edited):st.error("10 个式神都必须保持人工核验状态。")
-            else:
-                STORE.update_match(mid,{"match_date":ed,"match_time":et,"notes":en,"winner":ew},[clean_row(r) for r in edited])
-                st.session_state["flash_success"]=f"比赛 {mid} 的修改已保存。"
-                st.rerun()
-        confirm_delete=y.checkbox("我确认删除整场比赛",key="confirm_delete")
-        if y.button("🗑️ 删除比赛",use_container_width=True,disabled=not(ok and confirm_delete)):
-            STORE.delete_match(mid)
-            st.session_state["flash_success"]=f"比赛 {mid} 已删除。"
+t1,t2,t3,t4=st.tabs(
+    ["✨ 新比赛","🏁 补录结果","🗂️ 历史管理","⬇️ 导出"],
+    key="main_tabs",
+    on_change="rerun",
+)
+if t1.open:
+    with t1:
+        c1,c2=st.columns(2); red=c1.file_uploader("红方阵容详情",["png","jpg","jpeg"],key="red"); blue=c2.file_uploader("蓝方阵容详情",["png","jpg","jpeg"],key="blue")
+        if red:c1.image(red,width="stretch")
+        if blue:c2.image(blue,width="stretch")
+        if red and blue and st.button("✨ 智能识别双方",type="primary",use_container_width=True):
+            rb,bb=red.getvalue(),blue.getvalue()
+            image_pair_id=hashlib.sha256(rb+bb).hexdigest()[:16]
+            # A normal widget rerun never enters this block. OCR only runs on this explicit button click.
+            try:
+                rows,timing,panel_locs=recognize_pair_with_progress(rb,bb)
+            except ValueError as e:
+                st.error(str(e)); st.stop()
+            clear_editor_widget_state("new_")
+            st.session_state.rows=rows; st.session_state.rb=rb; st.session_state.bb=bb
+            st.session_state.ocr_done=True; st.session_state.ocr_timing=timing; st.session_state.panel_locs=panel_locs; st.session_state.image_pair_id=image_pair_id
+            # Stable per image pair: repeated clicks cannot create another match row.
+            st.session_state.current_match_id=f"img-{image_pair_id}"
             st.rerun()
-with t4:
-    m=STORE.matches();u=STORE.units(); a,b,c=st.columns(3);a.metric("比赛",len(m));b.metric("式神记录",len(u));c.metric("待补结果",int((m.status=="PENDING").sum()) if not m.empty else 0)
+        if "rows" in st.session_state:
+            st.success("OCR 已完成。之后修改式神、属性、御魂、核验状态、备注或密码都不会再次运行 OCR；属性变化只重算对应式神的御魂候选。")
+            timing=st.session_state.get("ocr_timing",{})
+            if timing:
+                with st.expander("⏱️ 本次识别性能诊断",expanded=False):
+                    cols=st.columns(min(5,len(timing)))
+                    for i,(k,v) in enumerate(timing.items()): cols[i%len(cols)].metric(k,f"{v:.2f}s")
+                    st.caption("V3.3 先自动定位『阵容详情』主面板，再在面板内部归一化坐标；正常路径每张截图仅 1 次 OCR。")
+                locs=st.session_state.get("panel_locs",{})
+                if locs:
+                    with st.expander("🎯 查看主面板定位结果",expanded=False):
+                        pc1,pc2=st.columns(2)
+                        for side,col,bts in (("RED",pc1,st.session_state.rb),("BLUE",pc2,st.session_state.bb)):
+                            loc=locs.get(side,{})
+                            with col:
+                                st.caption(f'{side} · 定位置信度 {loc.get("confidence",0):.1%} · bbox {loc.get("bbox")}')
+                                st.image(cv2.cvtColor(draw_panel_preview(decode(bts),loc),cv2.COLOR_BGR2RGB),width="stretch")
+            missing=sum(len(r.get("ocr_missing_fields",[])) for r in st.session_state.rows)
+            if missing: st.warning(f"整图 OCR 有 {missing}/80 个属性未识别。V3.3 为保证速度不会自动逐格重试，请在下方人工补充这些值。")
+            st.divider(); left,right=st.columns(2)
+            for side,col in (("RED",left),("BLUE",right)):
+                with col:
+                    st.subheader("🔴 红方" if side=="RED" else "🔵 蓝方")
+                    for r in [x for x in st.session_state.rows if x["side"]==side]:
+                        with st.container(border=True): edit_unit(r,f'new_{side}_{r["slot"]}')
+            st.divider(); a,b,c=st.columns([1,1,2]); md=a.date_input("日期",date.today()); mt=b.text_input("场次/时间"); notes=c.text_input("备注")
+            winner=st.selectbox("真实结果（未知可留空）",["","RED","BLUE","DRAW","INVALID"])
+            ok=gate("保存密码","save_password")
+            if st.button("💾 保存本场",type="primary",use_container_width=True,disabled=not ok):
+                rows=[clean_row(x) for x in st.session_state.rows]
+                if len(rows)!=10:st.error("必须有 10 个式神。")
+                elif not all(x.get("confirmed") for x in rows):st.error("请人工核验并勾选全部 10 个式神。")
+                else:
+                    mid=st.session_state.get("current_match_id") or f'img-{st.session_state.get("image_pair_id", hashlib.sha256(st.session_state.rb+st.session_state.bb).hexdigest()[:16])}'
+                    meta={"match_id":mid,"match_date":str(md),"match_time":mt,"winner":winner,"notes":notes,"reference_version":DB.version}
+                    mid=STORE.save_match(meta,rows,st.session_state.rb,st.session_state.bb)
+                    sample_msg=""
+                    try:
+                        samples=build_soul_samples(mid,rows,st.session_state.rb,st.session_state.bb,st.session_state.get("panel_locs",{}))
+                        n,errors=STORE.save_soul_samples(mid,samples)
+                        if n>0:
+                            cached_soul_gallery_features.clear()
+                        if n==10:
+                            sample_msg="；御魂图片样本 10/10 已保存"
+                        else:
+                            detail=("；"+"；".join(errors[:3])) if errors else ""
+                            st.session_state["flash_warning"]=f"比赛 {mid} 已保存，但御魂图片样本仅保存 {n}/10{detail}"
+                    except Exception as e:
+                        st.session_state["flash_warning"]=f"比赛 {mid} 已保存，但御魂图片样本未保存：{e}"
+                    if "flash_warning" not in st.session_state:
+                        st.session_state["flash_success"]=f"比赛 {mid} 保存成功{sample_msg}。"
+                    # Clear all new-match state so the refreshed page is ready for the next match.
+                    clear_editor_widget_state("new_")
+                    for k in ["rows","rb","bb","ocr_done","ocr_timing","panel_locs","image_pair_id","current_match_id","red","blue","save_password"]:
+                        st.session_state.pop(k,None)
+                    st.rerun()
+if t2.open:
+    with t2:
+        m=STORE.matches(); pending=m[m.status=="PENDING"] if not m.empty else m
+        if pending.empty:st.success("没有待补录结果的比赛。")
+        else:
+            st.dataframe(pending[["match_id","match_date","match_time","notes"]],hide_index=True,width="stretch")
+            mid=st.selectbox("比赛",pending.match_id.tolist()); w=st.radio("真实结果",["RED","BLUE","DRAW","INVALID"],horizontal=True); ok=gate("管理密码","winner_password")
+            if st.button("写入结果",type="primary",disabled=not ok):STORE.update_winner(mid,w);st.success("已更新");st.rerun()
+if t3.open:
+    with t3:
+        # Load the history list once. Ordinary editing reruns stay in memory.
+        if "history_matches_cache" not in st.session_state:
+            st.session_state.history_matches_cache=STORE.matches()
+        m=st.session_state.history_matches_cache
 
-    st.caption("所有数据导出均需要管理密码；导出文件不包含密码。")
-    export_ok=gate("管理密码","export_password")
+        if st.button("↻ 刷新历史数据",key="history_refresh"):
+            old_mid=st.session_state.pop("history_loaded_mid",None)
+            st.session_state.pop("history_rows_cache",None)
+            st.session_state.pop("history_meta_cache",None)
+            st.session_state.pop("history_matches_cache",None)
+            if old_mid:
+                clear_editor_widget_state(f"hist_{old_mid}_")
+            st.rerun()
 
-    for fn,label,mime in [
-        ("matches.csv","matches.csv","text/csv"),
-        ("units.csv","units.csv","text/csv"),
-        ("matches.jsonl","matches.jsonl","application/json"),
-    ]:
-        p=ROOT/"storage"/fn
-        if p.exists():
+        if m.empty:
+            st.info("还没有历史数据。")
+        else:
+            q=st.text_input("搜索 match_id / 日期 / 备注",key="history_search")
+            view=m.copy()
+            if q:
+                view=view[view.astype(str).apply(lambda x:x.str.contains(q,case=False,na=False)).any(axis=1)]
+            st.dataframe(view[["match_id","match_date","match_time","winner","status","notes","updated_at"]],hide_index=True,width="stretch")
+
+            if view.empty:
+                st.info("没有符合搜索条件的比赛。")
+            else:
+                mid=st.selectbox("选择历史比赛",view.match_id.tolist(),key="history_selected_mid")
+
+                # Fetch units only when a different match is selected.
+                if st.session_state.get("history_loaded_mid") != mid:
+                    old_mid=st.session_state.get("history_loaded_mid")
+                    if old_mid:
+                        clear_editor_widget_state(f"hist_{old_mid}_")
+                    units=STORE.units(mid)
+                    meta_row=m[m.match_id==mid].iloc[0]
+                    st.session_state.history_rows_cache=[]
+                    for _,x in units.iterrows():
+                        r=x.to_dict()
+                        r["confirmed"]=bool(r.get("confirmed"))
+                        r["soul_level"]=r.get("soul_level","") or ""
+                        st.session_state.history_rows_cache.append(r)
+                    st.session_state.history_meta_cache={
+                        "match_date":str(meta_row.match_date),
+                        "match_time":str(meta_row.match_time),
+                        "notes":str(meta_row.notes or ""),
+                        "winner":str(meta_row.winner or ""),
+                    }
+                    st.session_state.history_loaded_mid=mid
+                    meta0=st.session_state.history_meta_cache
+                    st.session_state[f"hist_meta_{mid}_date"]=meta0["match_date"]
+                    st.session_state[f"hist_meta_{mid}_time"]=meta0["match_time"]
+                    st.session_state[f"hist_meta_{mid}_notes"]=meta0["notes"]
+                    st.session_state[f"hist_meta_{mid}_winner"]=meta0["winner"]
+
+                rows=st.session_state.history_rows_cache
+                st.subheader("比赛详情")
+                edited=[]; L,R=st.columns(2)
+                for side,col in (("RED",L),("BLUE",R)):
+                    with col:
+                        for r in [x for x in rows if x["side"]==side]:
+                            with st.container(border=True):
+                                edited.append(edit_unit(r,f'hist_{mid}_{side}_{int(r["slot"])}'))
+
+                ea,eb,ec=st.columns([1,1,2])
+                ed=ea.text_input("日期",key=f"hist_meta_{mid}_date")
+                et=eb.text_input("时间",key=f"hist_meta_{mid}_time")
+                en=ec.text_input("备注",key=f"hist_meta_{mid}_notes")
+                winner_options=["","RED","BLUE","DRAW","INVALID"]
+                if st.session_state.get(f"hist_meta_{mid}_winner","") not in winner_options:
+                    st.session_state[f"hist_meta_{mid}_winner"]=""
+                ew=st.selectbox("结果",winner_options,key=f"hist_meta_{mid}_winner")
+
+                ok=gate("管理密码","history_password"); x,y=st.columns(2)
+                if x.button("保存历史修改",type="primary",use_container_width=True,disabled=not ok):
+                    if not all(r.get("confirmed") for r in edited):
+                        st.error("10 个式神都必须保持人工核验状态。")
+                    else:
+                        STORE.update_match(mid,{"match_date":ed,"match_time":et,"notes":en,"winner":ew},[clean_row(r) for r in edited])
+                        # Reload canonical DB state only after an explicit save.
+                        st.session_state.pop("history_matches_cache",None)
+                        st.session_state.pop("history_rows_cache",None)
+                        st.session_state.pop("history_meta_cache",None)
+                        st.session_state.pop("history_loaded_mid",None)
+                        clear_editor_widget_state(f"hist_{mid}_")
+                        st.session_state["flash_success"]=f"比赛 {mid} 的修改已保存。"
+                        st.rerun()
+
+                confirm_delete=y.checkbox("我确认删除整场比赛",key=f"confirm_delete_{mid}")
+                if y.button("🗑️ 删除比赛",key=f"delete_{mid}",use_container_width=True,disabled=not(ok and confirm_delete)):
+                    STORE.delete_match(mid)
+                    st.session_state.pop("history_matches_cache",None)
+                    st.session_state.pop("history_rows_cache",None)
+                    st.session_state.pop("history_meta_cache",None)
+                    st.session_state.pop("history_loaded_mid",None)
+                    clear_editor_widget_state(f"hist_{mid}_")
+                    st.session_state["flash_success"]=f"比赛 {mid} 已删除。"
+                    st.rerun()
+if t4.open:
+    with t4:
+        m=STORE.matches();u=STORE.units(); a,b,c=st.columns(3);a.metric("比赛",len(m));b.metric("式神记录",len(u));c.metric("待补结果",int((m.status=="PENDING").sum()) if not m.empty else 0)
+    
+        st.caption("所有数据导出均需要管理密码；导出文件不包含密码。")
+        export_ok=gate("管理密码","export_password")
+    
+        for fn,label,mime in [
+            ("matches.csv","matches.csv","text/csv"),
+            ("units.csv","units.csv","text/csv"),
+            ("matches.jsonl","matches.jsonl","application/json"),
+        ]:
+            p=ROOT/"storage"/fn
+            if p.exists():
+                st.download_button(
+                    f"下载 {label}",
+                    p.read_bytes(),
+                    fn,
+                    mime,
+                    use_container_width=True,
+                    disabled=not export_ok,
+                )
+    
+        st.divider()
+        st.subheader("🛡️ 数据库完整备份")
+        db_path=ROOT/"storage"/"matches.sqlite3"
+    
+        if db_path.exists():
+            st.caption(f"SQLite 数据库大小：{db_path.stat().st_size/1024:.1f} KB")
             st.download_button(
-                f"下载 {label}",
-                p.read_bytes(),
-                fn,
-                mime,
+                "⬇️ 下载 matches.sqlite3 完整备份",
+                data=db_path.read_bytes(),
+                file_name="matches.sqlite3",
+                mime="application/x-sqlite3",
                 use_container_width=True,
                 disabled=not export_ok,
             )
-
-    st.divider()
-    st.subheader("🛡️ 数据库完整备份")
-    db_path=ROOT/"storage"/"matches.sqlite3"
-
-    if db_path.exists():
-        st.caption(f"SQLite 数据库大小：{db_path.stat().st_size/1024:.1f} KB")
-        st.download_button(
-            "⬇️ 下载 matches.sqlite3 完整备份",
-            data=db_path.read_bytes(),
-            file_name="matches.sqlite3",
-            mime="application/x-sqlite3",
-            use_container_width=True,
-            disabled=not export_ok,
-        )
-    else:
-        st.warning("当前未找到 SQLite 数据库文件。")
+        else:
+            st.warning("当前未找到 SQLite 数据库文件。")
