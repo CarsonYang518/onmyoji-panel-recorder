@@ -2,6 +2,7 @@ from __future__ import annotations
 import os, sqlite3, json, uuid, shutil
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
@@ -91,9 +92,14 @@ class Store:
             "apikey":key,
             "Content-Type":content_type,"x-upsert":"true",
             "User-Agent":"onmyoji-panel-recorder/1.0"})
-        with urlopen(req,timeout=30) as resp:
-            if not (200 <= resp.status < 300):
-                raise RuntimeError(f"Storage upload HTTP {resp.status}")
+        try:
+            with urlopen(req,timeout=30) as resp:
+                if not (200 <= resp.status < 300):
+                    body=resp.read().decode("utf-8",errors="replace")
+                    raise RuntimeError(f"Storage HTTP {resp.status}: {body}")
+        except HTTPError as e:
+            body=e.read().decode("utf-8",errors="replace")
+            raise RuntimeError(f"Storage HTTP {e.code}: {body}") from e
 
     def save_soul_samples(self,mid,samples):
         """Upload confirmed soul crops, then index successful uploads in soul_samples.
